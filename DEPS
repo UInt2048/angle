@@ -40,7 +40,7 @@ vars = {
   'patched_yasm_revision': '720b70524a4424b15fc57e82263568c8ba0496ad',
 
   # Current revision of spirv-cross, the Khronos SPIRV cross compiler.
-  'spirv_cross_revision': 'fd5aa3ad51ece55a1b51fe6bfb271db6844ae291',
+  'spirv_cross_revision': 'f38cbeb814c73510b85697adbe5e894f9eac978f',
 
   # Current revision fo the SPIRV-Headers Vulkan support library.
   'spirv_headers_revision': 'f8bf11a0253a32375c32cad92c841237b96696c0',
@@ -58,7 +58,7 @@ vars = {
   'vulkan_tools_revision': '7774c964d3df8b127e8d1814526f4447a27446c2',
 
   # Current revision of Khronos Vulkan-ValidationLayers.
-  'vulkan_validation_revision': '36d7cca6fdc9ed86b01208bfb13721fdffb30af1',
+  'vulkan_validation_revision': '260a7c82e98850c5e19bfb75e1cca2b67b11a20e',
 
   # Three lines of non-changing comments so that
   # the commit queue can handle CLs rolling catapult
@@ -69,7 +69,7 @@ vars = {
 deps = {
 
   'build': {
-    'url': '{chromium_git}/chromium/src/build.git@a1cbf6469a5400f2b455ffba2e95ea47a1b47c94',
+    'url': 'https://github.com/kakashidinho/chromium_build.git@7b75d3a6f831f97ede498ea40f3276db0d8f0171',
     'condition': 'not build_with_chromium',
   },
 
@@ -249,7 +249,7 @@ deps = {
 
   'third_party/android_ndk': {
     'url': '{chromium_git}/android_ndk.git@27c0a8d090c666a50e40fceb4ee5b40b1a2d3f87',
-    'condition': 'not build_with_chromium',
+    'condition': 'checkout_android and not build_with_chromium',
   },
 }
 

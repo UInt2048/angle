@@ -32,7 +32,9 @@
 namespace
 {
 
-const char *kOpenGLESDylibName = "/System/Library/Frameworks/OpenGLES.framework/OpenGLES";
+constexpr EAGLRenderingAPI kGLESAPI = kEAGLRenderingAPIOpenGLES3;
+const char *kOpenGLESDylibNames[]   = {"/System/Library/Frameworks/OpenGLES.framework/OpenGLES",
+                                     "OpenGLES.framework/OpenGLES"};
 
 }
 
@@ -71,7 +73,7 @@ egl::Error DisplayEAGL::initialize(egl::Display *display)
         return egl::EglNotInitialized() << "Unable to query ANGLE's SystemInfo.";
     }
 
-    mContext = [[EAGLContext alloc] initWithAPI:kEAGLRenderingAPIOpenGLES3];
+    mContext = [[EAGLContext alloc] initWithAPI:kGLESAPI];
     if (mContext == nullptr)
     {
         return egl::EglNotInitialized() << "Could not create the EAGL context.";
@@ -79,7 +81,17 @@ egl::Error DisplayEAGL::initialize(egl::Display *display)
     [EAGLContext setCurrentContext:mContext];
 
     // There is no equivalent getProcAddress in EAGL so we open the dylib directly
-    void *handle = dlopen(kOpenGLESDylibName, RTLD_NOW);
+    void *handle = nullptr;
+
+    for (const char *glesLibName : kOpenGLESDylibNames)
+    {
+        handle = dlopen(glesLibName, RTLD_NOW);
+        if (handle)
+        {
+            break;
+        }
+    }
+
     if (!handle)
     {
         return egl::EglNotInitialized() << "Could not open the OpenGLES Framework.";
@@ -107,6 +119,7 @@ void DisplayEAGL::terminate()
     if (mContext != nullptr)
     {
         [EAGLContext setCurrentContext:nil];
+        [mContext release];
         mContext = nullptr;
     }
 }
@@ -131,8 +144,12 @@ SurfaceImpl *DisplayEAGL::createPbufferFromClientBuffer(const egl::SurfaceState 
                                                         EGLClientBuffer clientBuffer,
                                                         const egl::AttributeMap &attribs)
 {
+#if defined(ANGLE_DISABLE_IOSURFACE)
+    return nullptr;
+#else
     ASSERT(buftype == EGL_IOSURFACE_ANGLE);
     return new IOSurfaceSurfaceEAGL(state, mContext, clientBuffer, attribs);
+#endif
 }
 
 SurfaceImpl *DisplayEAGL::createPixmapSurface(const egl::SurfaceState &state,
@@ -253,13 +270,17 @@ egl::Error DisplayEAGL::validateClientBuffer(const egl::Config *configuration,
                                              const egl::AttributeMap &attribs) const
 {
     ASSERT(buftype == EGL_IOSURFACE_ANGLE);
+#if defined(ANGLE_DISABLE_IOSURFACE)
+    return egl::EglBadAttribute();
 
+#else
     if (!IOSurfaceSurfaceEAGL::validateAttributes(clientBuffer, attribs))
     {
         return egl::EglBadAttribute();
     }
 
     return egl::NoError();
+#endif  // ANGLE_DISABLE_IOSURFACE
 }
 
 std::string DisplayEAGL::getVendorString() const
@@ -275,9 +296,14 @@ EAGLContextObj DisplayEAGL::getEAGLContext() const
 
 void DisplayEAGL::generateExtensions(egl::DisplayExtensions *outExtensions) const
 {
+    outExtensions->flexibleSurfaceCompatibility = true;
+    outExtensions->surfacelessContext           = true;
+    outExtensions->deviceQuery                  = true;
+#    if defined(ANGLE_DISABLE_IOSURFACE)
+    outExtensions->iosurfaceClientBuffer = false;
+#    else
     outExtensions->iosurfaceClientBuffer = true;
-    outExtensions->surfacelessContext    = true;
-    outExtensions->deviceQuery           = true;
+#    endif
 
     // Contexts are virtualized so textures can be shared globally
     outExtensions->displayTextureShareGroup = true;
@@ -334,6 +360,7 @@ WorkerContextEAGL::WorkerContextEAGL(EAGLContextObj context) : mContext(context)
 WorkerContextEAGL::~WorkerContextEAGL()
 {
     [EAGLContext setCurrentContext:nil];
+    [mContext release];
     mContext = nullptr;
 }
 
@@ -355,7 +382,7 @@ void WorkerContextEAGL::unmakeCurrent()
 WorkerContext *DisplayEAGL::createWorkerContext(std::string *infoLog)
 {
     EAGLContextObj context = nullptr;
-    context                = [[EAGLContext alloc] initWithAPI:kEAGLRenderingAPIOpenGLES3];
+    context = [[EAGLContext alloc] initWithAPI:kGLESAPI sharegroup:mContext.sharegroup];
     if (!context)
     {
         *infoLog += "Could not create the EAGL context.";

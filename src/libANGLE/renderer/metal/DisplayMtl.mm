@@ -11,10 +11,14 @@
 #include "libANGLE/Context.h"
 #include "libANGLE/Display.h"
 #include "libANGLE/Surface.h"
+#include "libANGLE/renderer/DeviceImpl.h"
 #include "libANGLE/renderer/glslang_wrapper_utils.h"
 #include "libANGLE/renderer/metal/ContextMtl.h"
+#include "libANGLE/renderer/metal/ImageMtl.h"
 #include "libANGLE/renderer/metal/SurfaceMtl.h"
+#include "libANGLE/renderer/metal/SyncMtl.h"
 #include "libANGLE/renderer/metal/mtl_common.h"
+#include "libANGLE/renderer/metal/shaders/compiled/mtl_default_shaders.inc"
 #include "platform/Platform.h"
 
 #include "EGL/eglext.h"
@@ -25,7 +29,11 @@ namespace rx
 bool IsMetalDisplayAvailable()
 {
     // We only support macos 10.13+ and 11 for now. Since they are requirements for Metal 2.0.
+#if TARGET_OS_SIMULATOR
+    if (ANGLE_APPLE_AVAILABLE_XCI(10.13, 13.0, 13))
+#else
     if (ANGLE_APPLE_AVAILABLE_XCI(10.13, 13.0, 11))
+#endif
     {
         return true;
     }
@@ -37,8 +45,39 @@ DisplayImpl *CreateMetalDisplay(const egl::DisplayState &state)
     return new DisplayMtl(state);
 }
 
+// DeviceMTL implementation, implements DeviceImpl
+class DeviceMTL : public DeviceImpl
+{
+  public:
+    DeviceMTL() {}
+    ~DeviceMTL() override {}
+
+    egl::Error initialize() override { return egl::NoError(); }
+    egl::Error getAttribute(const egl::Display *display, EGLint attribute, void **outValue) override
+    {
+        DisplayMtl *displayImpl = mtl::GetImpl(display);
+
+        switch (attribute)
+        {
+            case EGL_MTL_DEVICE_ANGLE:
+                *outValue = displayImpl->getMetalDevice();
+                break;
+            default:
+                return egl::EglBadAttribute();
+        }
+
+        return egl::NoError();
+    }
+    EGLint getType() override { return 0; }
+    void generateExtensions(egl::DeviceExtensions *outExtensions) const override
+    {
+        outExtensions->deviceMTL = true;
+    }
+};
+
+// DisplayMtl implementation
 DisplayMtl::DisplayMtl(const egl::DisplayState &state)
-    : DisplayImpl(state), mUtils(this), mGlslangInitialized(false)
+    : DisplayImpl(state), mStateCache(mFeatures), mUtils(this), mGlslangInitialized(false)
 {}
 
 DisplayMtl::~DisplayMtl() {}
@@ -88,13 +127,13 @@ angle::Result DisplayMtl::initializeImpl(egl::Display *display)
 
 void DisplayMtl::terminate()
 {
-    for (mtl::TextureRef &nullTex : mNullTextures)
-    {
-        nullTex.reset();
-    }
     mUtils.onDestroy();
     mCmdQueue.reset();
-    mMetalDevice     = nil;
+    mDefaultShaders = nil;
+    mMetalDevice    = nil;
+#if defined(__IPHONE_12_0) || defined(__MAC_10_14)
+    mSharedEventListener = nil;
+#endif
     mCapsInitialized = false;
 
     if (mGlslangInitialized)
@@ -131,8 +170,7 @@ std::string DisplayMtl::getVendorString() const
 
 DeviceImpl *DisplayMtl::createDevice()
 {
-    UNIMPLEMENTED();
-    return nullptr;
+    return new DeviceMTL();
 }
 
 egl::Error DisplayMtl::waitClient(const gl::Context *context)
@@ -150,21 +188,20 @@ egl::Error DisplayMtl::waitClient(const gl::Context *context)
 egl::Error DisplayMtl::waitNative(const gl::Context *context, EGLint engine)
 {
     UNIMPLEMENTED();
-    return egl::EglBadAccess();
+    return egl::NoError();
 }
 
 SurfaceImpl *DisplayMtl::createWindowSurface(const egl::SurfaceState &state,
                                              EGLNativeWindowType window,
                                              const egl::AttributeMap &attribs)
 {
-    return new SurfaceMtl(this, state, window, attribs);
+    return new WindowSurfaceMtl(this, state, window, attribs);
 }
 
 SurfaceImpl *DisplayMtl::createPbufferSurface(const egl::SurfaceState &state,
                                               const egl::AttributeMap &attribs)
 {
-    UNIMPLEMENTED();
-    return static_cast<SurfaceImpl *>(0);
+    return new PBufferSurfaceMtl(this, state, attribs);
 }
 
 SurfaceImpl *DisplayMtl::createPbufferFromClientBuffer(const egl::SurfaceState &state,
@@ -172,8 +209,19 @@ SurfaceImpl *DisplayMtl::createPbufferFromClientBuffer(const egl::SurfaceState &
                                                        EGLClientBuffer clientBuffer,
                                                        const egl::AttributeMap &attribs)
 {
-    UNIMPLEMENTED();
-    return static_cast<SurfaceImpl *>(0);
+    switch (buftype)
+    {
+        case EGL_IOSURFACE_ANGLE:
+#if !defined(ANGLE_DISABLE_IOSURFACE)
+            return new IOSurfaceSurfaceMtl(this, state, clientBuffer, attribs);
+#endif
+            break;
+        case EGL_MTL_TEXTURE_MGL:
+            return new ExternalTextureSurfaceMtl(this, state, clientBuffer, attribs);
+        default:
+            UNREACHABLE();
+    }
+    return nullptr;
 }
 
 SurfaceImpl *DisplayMtl::createPixmapSurface(const egl::SurfaceState &state,
@@ -189,8 +237,7 @@ ImageImpl *DisplayMtl::createImage(const egl::ImageState &state,
                                    EGLenum target,
                                    const egl::AttributeMap &attribs)
 {
-    UNIMPLEMENTED();
-    return nullptr;
+    return new ImageMtl(state, context);
 }
 
 rx::ContextImpl *DisplayMtl::createContext(const gl::State &state,
@@ -210,9 +257,25 @@ StreamProducerImpl *DisplayMtl::createStreamProducerD3DTexture(
     return nullptr;
 }
 
+ExternalImageSiblingImpl *DisplayMtl::createExternalImageSibling(const gl::Context *context,
+                                                                 EGLenum target,
+                                                                 EGLClientBuffer buffer,
+                                                                 const egl::AttributeMap &attribs)
+{
+    switch (target)
+    {
+        case EGL_MTL_TEXTURE_MGL:
+            return new TextureImageSiblingMtl(buffer);
+
+        default:
+            UNREACHABLE();
+            return nullptr;
+    }
+}
+
 gl::Version DisplayMtl::getMaxSupportedESVersion() const
 {
-    return mtl::kMaxSupportedGLVersion;
+    return gl::Version(3, 0);
 }
 
 gl::Version DisplayMtl::getMaxConformantESVersion() const
@@ -222,8 +285,7 @@ gl::Version DisplayMtl::getMaxConformantESVersion() const
 
 EGLSyncImpl *DisplayMtl::createSync(const egl::AttributeMap &attribs)
 {
-    UNIMPLEMENTED();
-    return nullptr;
+    return new EGLSyncMtl(attribs);
 }
 
 egl::Error DisplayMtl::makeCurrent(egl::Surface *drawSurface,
@@ -241,6 +303,30 @@ egl::Error DisplayMtl::makeCurrent(egl::Surface *drawSurface,
 void DisplayMtl::generateExtensions(egl::DisplayExtensions *outExtensions) const
 {
     outExtensions->flexibleSurfaceCompatibility = true;
+    outExtensions->glColorspace                 = true;
+
+    if (ANGLE_APPLE_AVAILABLE_XCI(10.14, 13.0, 12.0))
+    {
+        // MTLSharedEvent is only available since Metal 2.1
+        outExtensions->fenceSync = true;
+        outExtensions->waitSync  = true;
+    }
+
+#if defined(ANGLE_DISABLE_IOSURFACE)
+    outExtensions->iosurfaceClientBuffer = false;
+#else
+    outExtensions->iosurfaceClientBuffer = true;
+#endif
+    outExtensions->mtlTextureClientBuffer = true;
+
+    outExtensions->surfacelessContext           = true;
+    outExtensions->robustResourceInitialization = true;
+    outExtensions->displayTextureShareGroup     = true;
+    outExtensions->deviceQuery                  = true;
+
+    // EGL_KHR_image
+    outExtensions->image     = true;
+    outExtensions->imageBase = true;
 }
 
 void DisplayMtl::generateCaps(egl::Caps *outCaps) const {}
@@ -270,24 +356,29 @@ egl::ConfigSet DisplayMtl::generateConfigs()
     config.transparentType = EGL_NONE;
 
     // Pbuffer
-    config.maxPBufferWidth  = 4096;
-    config.maxPBufferHeight = 4096;
-    config.maxPBufferPixels = 4096 * 4096;
+    config.bindToTextureTarget = EGL_TEXTURE_RECTANGLE_ANGLE;
+    config.maxPBufferWidth     = 4096;
+    config.maxPBufferHeight    = 4096;
+    config.maxPBufferPixels    = 4096 * 4096;
 
     // Caveat
     config.configCaveat = EGL_NONE;
 
     // Misc
     config.sampleBuffers     = 0;
-    config.samples           = 0;
     config.level             = 0;
     config.bindToTextureRGB  = EGL_FALSE;
-    config.bindToTextureRGBA = EGL_FALSE;
+    config.bindToTextureRGBA = EGL_TRUE;
 
-    config.surfaceType = EGL_WINDOW_BIT;
+    config.surfaceType = EGL_WINDOW_BIT | EGL_PBUFFER_BIT | EGL_SWAP_BEHAVIOR_PRESERVED_BIT;
 
-    config.minSwapInterval = 1;
+#if TARGET_OS_OSX || TARGET_OS_MACCATALYST
+    config.minSwapInterval = 0;
     config.maxSwapInterval = 1;
+#else
+    config.minSwapInterval               = 1;
+    config.maxSwapInterval               = 1;
+#endif
 
     config.renderTargetFormat = GL_RGBA8;
     config.depthStencilFormat = GL_DEPTH24_STENCIL8;
@@ -299,40 +390,103 @@ egl::ConfigSet DisplayMtl::generateConfigs()
 
     config.colorComponentType = EGL_COLOR_COMPONENT_TYPE_FIXED_EXT;
 
-    // Buffer sizes
-    config.redSize    = 8;
-    config.greenSize  = 8;
-    config.blueSize   = 8;
-    config.alphaSize  = 8;
-    config.bufferSize = config.redSize + config.greenSize + config.blueSize + config.alphaSize;
+    constexpr int samplesSupported[] = {0, 4};
 
-    // With DS
-    config.depthSize   = 24;
-    config.stencilSize = 8;
-    configs.add(config);
+    for (int samples : samplesSupported)
+    {
+        config.samples       = samples;
+        config.sampleBuffers = (samples == 0) ? 0 : 1;
 
-    // With D
-    config.depthSize   = 24;
-    config.stencilSize = 0;
-    configs.add(config);
+        // Buffer sizes
+        config.redSize    = 8;
+        config.greenSize  = 8;
+        config.blueSize   = 8;
+        config.alphaSize  = 8;
+        config.bufferSize = config.redSize + config.greenSize + config.blueSize + config.alphaSize;
 
-    // With S
-    config.depthSize   = 0;
-    config.stencilSize = 8;
-    configs.add(config);
+        // With DS
+        config.depthSize   = 24;
+        config.stencilSize = 8;
 
-    // No DS
-    config.depthSize   = 0;
-    config.stencilSize = 0;
-    configs.add(config);
+        configs.add(config);
+
+        // With D
+        config.depthSize   = 24;
+        config.stencilSize = 0;
+        configs.add(config);
+
+        // With S
+        config.depthSize   = 0;
+        config.stencilSize = 8;
+        configs.add(config);
+
+        // No DS
+        config.depthSize   = 0;
+        config.stencilSize = 0;
+        configs.add(config);
+    }
 
     return configs;
 }
 
 bool DisplayMtl::isValidNativeWindow(EGLNativeWindowType window) const
 {
-    NSObject *layer = (__bridge NSObject *)(window);
-    return [layer isKindOfClass:[CALayer class]];
+    ANGLE_MTL_OBJC_SCOPE
+    {
+        NSObject *layer = (__bridge NSObject *)(window);
+        return [layer isKindOfClass:[CALayer class]];
+    }
+}
+
+egl::Error DisplayMtl::validateClientBuffer(const egl::Config *configuration,
+                                            EGLenum buftype,
+                                            EGLClientBuffer clientBuffer,
+                                            const egl::AttributeMap &attribs) const
+{
+    switch (buftype)
+    {
+        case EGL_IOSURFACE_ANGLE:
+#if defined(ANGLE_DISABLE_IOSURFACE)
+            return egl::EglBadAttribute();
+
+#else
+            if (!IOSurfaceSurfaceMtl::ValidateAttributes(clientBuffer, attribs))
+            {
+                return egl::EglBadAttribute();
+            }
+#endif
+            break;
+        case EGL_MTL_TEXTURE_MGL:
+            if (!ExternalTextureSurfaceMtl::ValidateAttributes(this, clientBuffer, attribs))
+            {
+                return egl::EglBadAttribute();
+            }
+            break;
+        default:
+            UNREACHABLE();
+            return egl::EglBadAttribute();
+    }
+    return egl::NoError();
+}
+
+egl::Error DisplayMtl::validateImageClientBuffer(const gl::Context *context,
+                                                 EGLenum target,
+                                                 EGLClientBuffer clientBuffer,
+                                                 const egl::AttributeMap &attribs) const
+{
+    switch (target)
+    {
+        case EGL_MTL_TEXTURE_MGL:
+            if (!TextureImageSiblingMtl::ValidateClientBuffer(this, clientBuffer))
+            {
+                return egl::EglBadAttribute();
+            }
+            break;
+        default:
+            UNREACHABLE();
+            return egl::EglBadAttribute();
+    }
+    return egl::NoError();
 }
 
 std::string DisplayMtl::getRendererDescription() const
@@ -367,45 +521,6 @@ const gl::Extensions &DisplayMtl::getNativeExtensions() const
     return mNativeExtensions;
 }
 
-const mtl::TextureRef &DisplayMtl::getNullTexture(const gl::Context *context, gl::TextureType type)
-{
-    // TODO(hqle): Use rx::IncompleteTextureSet.
-    ContextMtl *contextMtl = mtl::GetImpl(context);
-    if (!mNullTextures[type])
-    {
-        // initialize content with zeros
-        MTLRegion region           = MTLRegionMake2D(0, 0, 1, 1);
-        const uint8_t zeroPixel[4] = {0, 0, 0, 255};
-
-        const auto &rgbaFormat = getPixelFormat(angle::FormatID::R8G8B8A8_UNORM);
-
-        switch (type)
-        {
-            case gl::TextureType::_2D:
-                (void)(mtl::Texture::Make2DTexture(contextMtl, rgbaFormat, 1, 1, 1, false, false,
-                                                   &mNullTextures[type]));
-                mNullTextures[type]->replaceRegion(contextMtl, region, 0, 0, zeroPixel,
-                                                   sizeof(zeroPixel));
-                break;
-            case gl::TextureType::CubeMap:
-                (void)(mtl::Texture::MakeCubeTexture(contextMtl, rgbaFormat, 1, 1, false, false,
-                                                     &mNullTextures[type]));
-                for (int f = 0; f < 6; ++f)
-                {
-                    mNullTextures[type]->replaceRegion(contextMtl, region, 0, f, zeroPixel,
-                                                       sizeof(zeroPixel));
-                }
-                break;
-            default:
-                UNREACHABLE();
-                // NOTE(hqle): Support more texture types.
-        }
-        ASSERT(mNullTextures[type]);
-    }
-
-    return mNullTextures[type];
-}
-
 void DisplayMtl::ensureCapsInitialized() const
 {
     if (mCapsInitialized)
@@ -426,30 +541,42 @@ void DisplayMtl::ensureCapsInitialized() const
     mNativeCaps.maxElementIndex  = std::numeric_limits<GLuint>::max() - 1;
     mNativeCaps.max3DTextureSize = 2048;
 #if TARGET_OS_OSX || TARGET_OS_MACCATALYST
-    mNativeCaps.max2DTextureSize          = 16384;
-    mNativeCaps.maxVaryingVectors         = 31;
-    mNativeCaps.maxVertexOutputComponents = 124;
+    mNativeCaps.max2DTextureSize = 16384;
+    // On macOS exclude [[position]] from maxVaryingVectors.
+    mNativeCaps.maxVaryingVectors         = 31 - 1;
+    mNativeCaps.maxVertexOutputComponents = mNativeCaps.maxFragmentInputComponents = 124 - 4;
 #else
-    if ([getMetalDevice() supportsFeatureSet:MTLFeatureSet_iOS_GPUFamily3_v1])
+    if (supportiOSGPUFamily(3))
     {
         mNativeCaps.max2DTextureSize          = 16384;
-        mNativeCaps.maxVertexOutputComponents = 124;
-        mNativeCaps.maxVaryingVectors         = mNativeCaps.maxVertexOutputComponents / 4;
+        mNativeCaps.maxVertexOutputComponents = mNativeCaps.maxFragmentInputComponents = 124;
+        mNativeCaps.maxVaryingVectors = mNativeCaps.maxVertexOutputComponents / 4;
     }
     else
     {
         mNativeCaps.max2DTextureSize          = 8192;
-        mNativeCaps.maxVertexOutputComponents = 60;
-        mNativeCaps.maxVaryingVectors         = mNativeCaps.maxVertexOutputComponents / 4;
+        mNativeCaps.maxVertexOutputComponents = mNativeCaps.maxFragmentInputComponents = 60;
+        mNativeCaps.maxVaryingVectors = mNativeCaps.maxVertexOutputComponents / 4;
     }
 #endif
 
-    mNativeCaps.maxArrayTextureLayers = 2048;
-    mNativeCaps.maxLODBias            = 0;
-    mNativeCaps.maxCubeMapTextureSize = mNativeCaps.max2DTextureSize;
-    mNativeCaps.maxRenderbufferSize   = mNativeCaps.max2DTextureSize;
-    mNativeCaps.minAliasedPointSize   = 1;
-    mNativeCaps.maxAliasedPointSize   = 511;
+    mNativeCaps.maxArrayTextureLayers   = 2048;
+    mNativeCaps.maxLODBias              = 2.0;
+    mNativeCaps.maxCubeMapTextureSize   = mNativeCaps.max2DTextureSize;
+    mNativeCaps.maxRenderbufferSize     = mNativeCaps.max2DTextureSize;
+    mNativeCaps.maxRectangleTextureSize = mNativeCaps.max2DTextureSize;
+    mNativeCaps.minAliasedPointSize     = 1;
+    // NOTE(hqle): Metal has some problems drawing big point size even though
+    // Metal-Feature-Set-Tables.pdf says that max supported point size is 511. We limit it to 255
+    // on Intel and 64 on AMD for now.
+    if ([mMetalDevice.get().name rangeOfString:@"Intel"].location != NSNotFound)
+    {
+        mNativeCaps.maxAliasedPointSize = 255;
+    }
+    else
+    {
+        mNativeCaps.maxAliasedPointSize = 64;
+    }
 
     mNativeCaps.minAliasedLineWidth = 1.0f;
     mNativeCaps.maxAliasedLineWidth = 1.0f;
@@ -461,10 +588,11 @@ void DisplayMtl::ensureCapsInitialized() const
     mNativeCaps.maxViewportWidth     = mNativeCaps.max2DTextureSize;
     mNativeCaps.maxViewportHeight    = mNativeCaps.max2DTextureSize;
 
-    // NOTE(hqle): MSAA
+    // MSAA
+    mNativeCaps.maxSamples             = mFormatTable.getMaxSamples();
     mNativeCaps.maxSampleMaskWords     = 0;
-    mNativeCaps.maxColorTextureSamples = 1;
-    mNativeCaps.maxDepthTextureSamples = 1;
+    mNativeCaps.maxColorTextureSamples = mNativeCaps.maxSamples;
+    mNativeCaps.maxDepthTextureSamples = mNativeCaps.maxSamples;
     mNativeCaps.maxIntegerSamples      = 1;
 
     mNativeCaps.maxVertexAttributes           = mtl::kMaxVertexAttribs;
@@ -472,8 +600,8 @@ void DisplayMtl::ensureCapsInitialized() const
     mNativeCaps.maxVertexAttribRelativeOffset = std::numeric_limits<GLint>::max();
     mNativeCaps.maxVertexAttribStride         = std::numeric_limits<GLint>::max();
 
-    mNativeCaps.maxElementsIndices  = std::numeric_limits<GLuint>::max();
-    mNativeCaps.maxElementsVertices = std::numeric_limits<GLuint>::max();
+    mNativeCaps.maxElementsIndices  = std::numeric_limits<GLint>::max();
+    mNativeCaps.maxElementsVertices = std::numeric_limits<GLint>::max();
 
     // Looks like all floats are IEEE according to the docs here:
     mNativeCaps.vertexHighpFloat.setIEEEFloat();
@@ -490,27 +618,30 @@ void DisplayMtl::ensureCapsInitialized() const
     mNativeCaps.fragmentMediumpInt.setTwosComplementInt(32);
     mNativeCaps.fragmentLowpInt.setTwosComplementInt(32);
 
-    GLuint maxUniformVectors = mtl::kDefaultUniformsMaxSize / (sizeof(GLfloat) * 4);
+    // Uniform limits
+    GLuint maxDefaultUniformVectors = mtl::kDefaultUniformsMaxSize / (sizeof(GLfloat) * 4);
 
-    const GLuint maxUniformComponents = maxUniformVectors * 4;
+    const GLuint maxDefaultUniformComponents = maxDefaultUniformVectors * 4;
 
-    // Uniforms are implemented using a uniform buffer, so the max number of uniforms we can
-    // support is the max buffer range divided by the size of a single uniform (4X float).
-    mNativeCaps.maxVertexUniformVectors                              = maxUniformVectors;
-    mNativeCaps.maxShaderUniformComponents[gl::ShaderType::Vertex]   = maxUniformComponents;
-    mNativeCaps.maxFragmentUniformVectors                            = maxUniformVectors;
-    mNativeCaps.maxShaderUniformComponents[gl::ShaderType::Fragment] = maxUniformComponents;
+    mNativeCaps.maxVertexUniformVectors                              = maxDefaultUniformVectors;
+    mNativeCaps.maxShaderUniformComponents[gl::ShaderType::Vertex]   = maxDefaultUniformComponents;
+    mNativeCaps.maxFragmentUniformVectors                            = maxDefaultUniformVectors;
+    mNativeCaps.maxShaderUniformComponents[gl::ShaderType::Fragment] = maxDefaultUniformComponents;
 
     // NOTE(hqle): support UBO (ES 3.0 feature)
-    mNativeCaps.maxShaderUniformBlocks[gl::ShaderType::Vertex]   = 0;
-    mNativeCaps.maxShaderUniformBlocks[gl::ShaderType::Fragment] = 0;
-    mNativeCaps.maxCombinedUniformBlocks                         = 0;
+    mNativeCaps.maxShaderUniformBlocks[gl::ShaderType::Vertex]   = mtl::kMaxShaderUBOs;
+    mNativeCaps.maxShaderUniformBlocks[gl::ShaderType::Fragment] = mtl::kMaxShaderUBOs;
+    mNativeCaps.maxCombinedUniformBlocks                         = mtl::kMaxGLUBOBindings;
 
     // Note that we currently implement textures as combined image+samplers, so the limit is
     // the minimum of supported samplers and sampled images.
-    mNativeCaps.maxCombinedTextureImageUnits                         = mtl::kMaxShaderSamplers;
+    mNativeCaps.maxCombinedTextureImageUnits                         = mtl::kMaxGLSamplerBindings;
     mNativeCaps.maxShaderTextureImageUnits[gl::ShaderType::Fragment] = mtl::kMaxShaderSamplers;
     mNativeCaps.maxShaderTextureImageUnits[gl::ShaderType::Vertex]   = mtl::kMaxShaderSamplers;
+
+    // No info from Metal given, use default spec values:
+    mNativeCaps.minProgramTexelOffset = -8;
+    mNativeCaps.maxProgramTexelOffset = 7;
 
     // NOTE(hqle): support storage buffer.
     const uint32_t maxPerStageStorageBuffers                     = 0;
@@ -519,18 +650,20 @@ void DisplayMtl::ensureCapsInitialized() const
     mNativeCaps.maxCombinedShaderStorageBlocks                   = maxPerStageStorageBuffers;
 
     // Fill in additional limits for UBOs and SSBOs.
-    mNativeCaps.maxUniformBufferBindings     = 0;
-    mNativeCaps.maxUniformBlockSize          = 0;
-    mNativeCaps.uniformBufferOffsetAlignment = 0;
+    mNativeCaps.maxUniformBufferBindings = mNativeCaps.maxCombinedUniformBlocks;
+    mNativeCaps.maxUniformBlockSize      = mtl::kMaxUBOSize;  // Default according to GLES 3.0 spec.
+    mNativeCaps.uniformBufferOffsetAlignment = 1;
 
     mNativeCaps.maxShaderStorageBufferBindings     = 0;
     mNativeCaps.maxShaderStorageBlockSize          = 0;
     mNativeCaps.shaderStorageBufferOffsetAlignment = 0;
 
-    // NOTE(hqle): support UBO
+    // UBO plus default uniform limits
+    const uint32_t maxCombinedUniformComponents =
+        maxDefaultUniformComponents + mtl::kMaxUBOSize * mtl::kMaxShaderUBOs / 4;
     for (gl::ShaderType shaderType : gl::kAllGraphicsShaderTypes)
     {
-        mNativeCaps.maxCombinedShaderUniformComponents[shaderType] = maxUniformComponents;
+        mNativeCaps.maxCombinedShaderUniformComponents[shaderType] = maxCombinedUniformComponents;
     }
 
     mNativeCaps.maxCombinedShaderOutputResources = 0;
@@ -542,8 +675,8 @@ void DisplayMtl::ensureCapsInitialized() const
     mNativeCaps.maxTransformFeedbackSeparateComponents =
         gl::IMPLEMENTATION_MAX_TRANSFORM_FEEDBACK_SEPARATE_COMPONENTS;
 
-    // NOTE(hqle): support MSAA.
-    mNativeCaps.maxSamples = 1;
+    // GL_OES_get_program_binary
+    mNativeCaps.programBinaryFormats.push_back(GL_PROGRAM_BINARY_ANGLE);
 
     // GL_APPLE_clip_distance
     mNativeCaps.maxClipDistances = 8;
@@ -555,29 +688,38 @@ void DisplayMtl::initializeExtensions() const
     mNativeExtensions = gl::Extensions();
 
     // Enable this for simple buffer readback testing, but some functionality is missing.
-    // NOTE(hqle): Support full mapBufferRange extension.
     mNativeExtensions.mapBufferOES           = true;
-    mNativeExtensions.mapBufferRange         = false;
+    mNativeExtensions.mapBufferRange         = true;
     mNativeExtensions.textureStorage         = true;
-    mNativeExtensions.drawBuffers            = false;
+    mNativeExtensions.drawBuffers            = true;
     mNativeExtensions.fragDepth              = true;
-    mNativeExtensions.framebufferBlit        = false;
-    mNativeExtensions.framebufferMultisample = false;
+    mNativeExtensions.framebufferBlit        = true;
+    mNativeExtensions.framebufferMultisample = true;
     mNativeExtensions.copyTexture            = false;
     mNativeExtensions.copyCompressedTexture  = false;
-    mNativeExtensions.debugMarker            = false;
+    mNativeExtensions.debugMarker            = true;
     mNativeExtensions.robustness             = true;
     mNativeExtensions.textureBorderClampOES  = false;  // not implemented yet
     mNativeExtensions.translatedShaderSource = true;
     mNativeExtensions.discardFramebuffer     = true;
 
+    // EXT_multisampled_render_to_texture
+    if (mFeatures.allowMultisampleStoreAndResolve.enabled &&
+        mFeatures.hasDepthAutoResolve.enabled && mFeatures.hasStencilAutoResolve.enabled)
+    {
+        mNativeExtensions.multisampledRenderToTexture = true;
+    }
+
     // Enable EXT_blend_minmax
     mNativeExtensions.blendMinMax = true;
 
-    mNativeExtensions.eglImageOES         = false;
+    mNativeExtensions.eglImageOES         = true;
     mNativeExtensions.eglImageExternalOES = false;
     // NOTE(hqle): Support GL_OES_EGL_image_external_essl3.
     mNativeExtensions.eglImageExternalEssl3OES = false;
+
+    // MGL_EGL_image_cube
+    mNativeExtensions.eglImageCubeMGL = true;
 
     mNativeExtensions.memoryObject   = false;
     mNativeExtensions.memoryObjectFd = false;
@@ -585,15 +727,14 @@ void DisplayMtl::initializeExtensions() const
     mNativeExtensions.semaphore   = false;
     mNativeExtensions.semaphoreFd = false;
 
-    mNativeExtensions.instancedArraysANGLE = mFeatures.hasBaseVertexInstancedDraw.enabled;
-    mNativeExtensions.instancedArraysEXT   = mNativeExtensions.instancedArraysANGLE;
+    mNativeExtensions.instancedArraysANGLE = true;
+    mNativeExtensions.instancedArraysEXT   = true;
 
     mNativeExtensions.robustBufferAccessBehavior = false;
 
     mNativeExtensions.eglSyncOES = false;
 
-    // NOTE(hqle): support occlusion query
-    mNativeExtensions.occlusionQueryBoolean = false;
+    mNativeExtensions.occlusionQueryBoolean = true;
 
     mNativeExtensions.disjointTimerQuery          = false;
     mNativeExtensions.queryCounterBitsTimeElapsed = false;
@@ -602,17 +743,45 @@ void DisplayMtl::initializeExtensions() const
     mNativeExtensions.textureFilterAnisotropic = true;
     mNativeExtensions.maxTextureAnisotropy     = 16;
 
-    // NOTE(hqle): Support true NPOT textures.
-    mNativeExtensions.textureNPOTOES = false;
+    mNativeExtensions.textureNPOTOES = true;
 
-    mNativeExtensions.texture3DOES = false;
+    mNativeExtensions.texture3DOES = true;
 
     mNativeExtensions.standardDerivativesOES = true;
 
     mNativeExtensions.elementIndexUintOES = true;
 
+    // GL_OES_get_program_binary
+    mNativeExtensions.getProgramBinaryOES = true;
+
     // GL_APPLE_clip_distance
     mNativeExtensions.clipDistanceAPPLE = true;
+
+    // GL_NV_pixel_buffer_object
+    mNativeExtensions.pixelBufferObjectNV = true;
+
+    if (ANGLE_APPLE_AVAILABLE_XCI(10.14, 13.0, 12.0))
+    {
+        // MTLSharedEvent is only available since Metal 2.1
+
+        // GL_NV_fence
+        mNativeExtensions.fenceNV = true;
+
+        // GL_OES_EGL_sync
+        mNativeExtensions.eglSyncOES = true;
+    }
+
+    // GL_ANGLE_texture_rectangle
+    mNativeExtensions.textureRectangle = true;
+
+    // GL_ANGLE_client_arrays
+    mNativeExtensions.clientArrays = true;
+
+    // GL_ANGLE_robust_resource_initialization
+    mNativeExtensions.robustResourceInitialization = true;
+
+    // GL_CHROMIUM_copy_texture
+    mNativeExtensions.copyTexture = true;
 }
 
 void DisplayMtl::initializeTextureCaps() const
@@ -636,37 +805,286 @@ void DisplayMtl::initializeFeatures()
     // default values:
     mFeatures.hasBaseVertexInstancedDraw.enabled        = true;
     mFeatures.hasDepthTextureFiltering.enabled          = false;
+    mFeatures.hasExplicitMemBarrier.enabled             = false;
     mFeatures.hasNonUniformDispatch.enabled             = true;
+    mFeatures.hasStencilOutput.enabled                  = false;
     mFeatures.hasTextureSwizzle.enabled                 = false;
+    mFeatures.allowInlineConstVertexData.enabled        = true;
     mFeatures.allowSeparatedDepthStencilBuffers.enabled = false;
+    mFeatures.forceBufferGPUStorage.enabled             = false;
+    mFeatures.emulateDepthRangeMappingInShader.enabled  = true;
+
+    ANGLE_FEATURE_CONDITION((&mFeatures), hasDepthAutoResolve, supportEitherGPUFamily(3, 2));
+    ANGLE_FEATURE_CONDITION((&mFeatures), hasStencilAutoResolve, supportEitherGPUFamily(5, 2));
+    ANGLE_FEATURE_CONDITION((&mFeatures), allowBufferReadWrite, supportEitherGPUFamily(3, 1));
+    ANGLE_FEATURE_CONDITION((&mFeatures), allowRuntimeSamplerCompareMode,
+                            supportEitherGPUFamily(3, 1));
+    ANGLE_FEATURE_CONDITION((&mFeatures), allowMultisampleStoreAndResolve,
+                            supportEitherGPUFamily(3, 1));
+
+    if (ANGLE_APPLE_AVAILABLE_XCI(10.15, 13.0, 13.0))
+    {
+        // Disable Compute Shader based mipmap generation on iOS GPU family 3 and below.
+        ANGLE_FEATURE_CONDITION((&mFeatures), forceNonCSBaseMipmapGeneration,
+                                !supportEitherGPUFamily(4, 1));
+    }
+    else
+    {
+        // NOTE(hqle): Disable Compute Shader based mipmap generation on macOS 10.14, iOS 12.0 and
+        // below also. Until CS based mipmap generation can be tested on those platform.
+        mFeatures.forceNonCSBaseMipmapGeneration.enabled = true;
+    }
+
+    if (ANGLE_APPLE_AVAILABLE_XCI(10.14, 13.0, 12.0))
+    {
+        mFeatures.hasStencilOutput.enabled                 = true;
+        mFeatures.emulateDepthRangeMappingInShader.enabled = false;
+        ANGLE_FEATURE_CONDITION((&mFeatures), hasExplicitMemBarrier,
+                                (TARGET_OS_OSX || TARGET_OS_MACCATALYST) && !ANGLE_MTL_ARM);
+    }
+    if (ANGLE_APPLE_AVAILABLE_XCI(10.15, 13.0, 13.0))
+    {
+        ANGLE_FEATURE_CONDITION((&mFeatures), hasTextureSwizzle, supportEitherGPUFamily(1, 2));
+    }
 
 #if TARGET_OS_OSX || TARGET_OS_MACCATALYST
-    mFeatures.hasDepthTextureFiltering.enabled = true;
+    mFeatures.hasDepthTextureFiltering.enabled = !ANGLE_MTL_ARM;
+    mFeatures.breakRenderPassIsCheap.enabled   = !ANGLE_MTL_ARM;
 
-    // Texture swizzle is only supported if macos sdk 10.15 is present
-#    if defined(__MAC_10_15)
-    if (ANGLE_APPLE_AVAILABLE_XC(10.15, 13.0))
-    {
-        // The runtime OS must be MacOS 10.15+ or Mac Catalyst for this to be supported:
-        ANGLE_FEATURE_CONDITION((&mFeatures), hasTextureSwizzle,
-                                [getMetalDevice() supportsFamily:MTLGPUFamilyMac2]);
-    }
-#    endif
-#elif TARGET_OS_IOS
+#elif TARGET_OS_IOS || TARGET_OS_TV
+    mFeatures.breakRenderPassIsCheap.enabled = false;
+
     // Base Vertex drawing is only supported since GPU family 3.
-    ANGLE_FEATURE_CONDITION((&mFeatures), hasBaseVertexInstancedDraw,
-                            [getMetalDevice() supportsFeatureSet:MTLFeatureSet_iOS_GPUFamily3_v1]);
+    ANGLE_FEATURE_CONDITION((&mFeatures), hasBaseVertexInstancedDraw, supportiOSGPUFamily(3));
 
     ANGLE_FEATURE_CONDITION((&mFeatures), hasNonUniformDispatch,
-                            [getMetalDevice() supportsFeatureSet:MTLFeatureSet_iOS_GPUFamily4_v1]);
+                            TARGET_OS_IOS && supportiOSGPUFamily(4));
 
-#    if !TARGET_OS_SIMULATOR
-    mFeatures.allowSeparatedDepthStencilBuffers.enabled = true;
-#    endif
+    ANGLE_FEATURE_CONDITION((&mFeatures), allowSeparatedDepthStencilBuffers, !TARGET_OS_SIMULATOR);
+
 #endif
 
     angle::PlatformMethods *platform = ANGLEPlatformCurrent();
     platform->overrideFeaturesMtl(platform, &mFeatures);
 }
+
+angle::Result DisplayMtl::initializeShaderLibrary()
+{
+    mtl::AutoObjCObj<NSError> err = nil;
+
+    const uint8_t *compiled_shader_binary;
+    size_t compiled_shader_binary_len;
+
+#if !defined(NDEBUG)
+    if (getFeatures().hasStencilOutput.enabled)
+    {
+        compiled_shader_binary     = compiled_default_metallib_2_1_debug;
+        compiled_shader_binary_len = compiled_default_metallib_2_1_debug_len;
+    }
+    else
+    {
+        compiled_shader_binary     = compiled_default_metallib_debug;
+        compiled_shader_binary_len = compiled_default_metallib_debug_len;
+    }
+#else
+    if (getFeatures().hasStencilOutput.enabled)
+    {
+        compiled_shader_binary     = compiled_default_metallib_2_1;
+        compiled_shader_binary_len = compiled_default_metallib_2_1_len;
+    }
+    else
+    {
+        compiled_shader_binary     = compiled_default_metallib;
+        compiled_shader_binary_len = compiled_default_metallib_len;
+    }
+#endif
+
+    mDefaultShaders = CreateShaderLibraryFromBinary(getMetalDevice(), compiled_shader_binary,
+                                                    compiled_shader_binary_len, &err);
+
+    if (err && !mDefaultShaders)
+    {
+        ANGLE_MTL_OBJC_SCOPE
+        {
+            ERR() << "Internal error: " << err.get().localizedDescription.UTF8String;
+        }
+        return angle::Result::Stop;
+    }
+
+    return angle::Result::Continue;
+}
+
+id<MTLLibrary> DisplayMtl::getDefaultShadersLib()
+{
+    if (!mDefaultShaders)
+    {
+        if (initializeShaderLibrary() != angle::Result::Continue)
+        {
+            return nil;
+        }
+    }
+    return mDefaultShaders;
+}
+
+bool DisplayMtl::supportiOSGPUFamily(uint8_t iOSFamily) const
+{
+#if (!TARGET_OS_IOS && !TARGET_OS_TV) || TARGET_OS_MACCATALYST
+    return false;
+#else
+#    if (__IPHONE_OS_VERSION_MAX_ALLOWED >= 130000) || (__TV_OS_VERSION_MAX_ALLOWED >= 130000)
+    // If device supports [MTLDevice supportsFamily:], then use it.
+    if (ANGLE_APPLE_AVAILABLE_I(13.0))
+    {
+        MTLGPUFamily family;
+        switch (iOSFamily)
+        {
+            case 1:
+                family = MTLGPUFamilyApple1;
+                break;
+            case 2:
+                family = MTLGPUFamilyApple2;
+                break;
+            case 3:
+                family = MTLGPUFamilyApple3;
+                break;
+            case 4:
+                family = MTLGPUFamilyApple4;
+                break;
+            case 5:
+                family = MTLGPUFamilyApple5;
+                break;
+#        if TARGET_OS_IOS
+            case 6:
+                family = MTLGPUFamilyApple6;
+                break;
+#        endif
+            default:
+                return false;
+        }
+        return [getMetalDevice() supportsFamily:family];
+    }  // Metal 2.2
+#    endif  // __IPHONE_OS_VERSION_MAX_ALLOWED
+
+    // If device doesn't support [MTLDevice supportsFamily:], then use
+    // [MTLDevice supportsFeatureSet:].
+    MTLFeatureSet featureSet;
+    switch (iOSFamily)
+    {
+#    if TARGET_OS_IOS
+        case 1:
+            featureSet = MTLFeatureSet_iOS_GPUFamily1_v1;
+            break;
+        case 2:
+            featureSet = MTLFeatureSet_iOS_GPUFamily2_v1;
+            break;
+        case 3:
+            featureSet = MTLFeatureSet_iOS_GPUFamily3_v1;
+            break;
+        case 4:
+            featureSet = MTLFeatureSet_iOS_GPUFamily4_v1;
+            break;
+#        if __IPHONE_OS_VERSION_MAX_ALLOWED >= 120000
+        case 5:
+            featureSet = MTLFeatureSet_iOS_GPUFamily5_v1;
+            break;
+#        endif  // __IPHONE_OS_VERSION_MAX_ALLOWED
+#    elif TARGET_OS_TV
+        case 1:
+        case 2:
+            featureSet = MTLFeatureSet_tvOS_GPUFamily1_v1;
+            break;
+        case 3:
+            featureSet = MTLFeatureSet_tvOS_GPUFamily2_v1;
+            break;
+#    endif  // TARGET_OS_IOS
+        default:
+            return false;
+    }
+
+    return [getMetalDevice() supportsFeatureSet:featureSet];
+#endif      // TARGET_OS_IOS || TARGET_OS_TV
+}
+
+bool DisplayMtl::supportMacGPUFamily(uint8_t macFamily) const
+{
+#if TARGET_OS_OSX || TARGET_OS_MACCATALYST
+#    if defined(__MAC_10_15)
+    // If device supports [MTLDevice supportsFamily:], then use it.
+    if (ANGLE_APPLE_AVAILABLE_XC(10.15, 13.0))
+    {
+        MTLGPUFamily family;
+
+        switch (macFamily)
+        {
+#        if TARGET_OS_MACCATALYST
+            case 1:
+                family = MTLGPUFamilyMacCatalyst1;
+                break;
+            case 2:
+                family = MTLGPUFamilyMacCatalyst2;
+                break;
+#        else   // TARGET_OS_MACCATALYST
+            case 1:
+                family = MTLGPUFamilyMac1;
+                break;
+            case 2:
+                family = MTLGPUFamilyMac2;
+                break;
+#        endif  // TARGET_OS_MACCATALYST
+            default:
+                return false;
+        }
+
+        return [getMetalDevice() supportsFamily:family];
+    }  // Metal 2.2
+#    endif
+
+    // If device doesn't support [MTLDevice supportsFamily:], then use
+    // [MTLDevice supportsFeatureSet:].
+#    if TARGET_OS_MACCATALYST
+    UNREACHABLE();
+    return false;
+#    else
+    MTLFeatureSet featureSet;
+    switch (macFamily)
+    {
+        case 1:
+            featureSet = MTLFeatureSet_macOS_GPUFamily1_v1;
+            break;
+#        if defined(__MAC_10_14)
+        case 2:
+            featureSet = MTLFeatureSet_macOS_GPUFamily2_v1;
+            break;
+#        endif
+        default:
+            return false;
+    }
+    return [getMetalDevice() supportsFeatureSet:featureSet];
+#    endif  // TARGET_OS_MACCATALYST
+#else       // #if TARGET_OS_OSX || TARGET_OS_MACCATALYST
+
+    return false;
+
+#endif
+}
+
+bool DisplayMtl::supportEitherGPUFamily(uint8_t iOSFamily, uint8_t macFamily) const
+{
+    return supportiOSGPUFamily(iOSFamily) || supportMacGPUFamily(macFamily);
+}
+
+#if defined(__IPHONE_12_0) || defined(__MAC_10_14)
+mtl::AutoObjCObj<MTLSharedEventListener> DisplayMtl::getOrCreateSharedEventListener()
+{
+    if (!mSharedEventListener)
+    {
+        ANGLE_MTL_OBJC_SCOPE
+        {
+            mSharedEventListener = [[[MTLSharedEventListener alloc] init] ANGLE_MTL_AUTORELEASE];
+        }
+    }
+    return mSharedEventListener;
+}
+#endif
 
 }  // namespace rx

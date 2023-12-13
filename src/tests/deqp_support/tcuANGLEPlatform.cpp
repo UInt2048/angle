@@ -24,6 +24,7 @@
 #include <EGL/eglext.h>
 
 #include "egluGLContextFactory.hpp"
+#include "platform/FeaturesMtl.h"
 #include "tcuANGLENativeDisplayFactory.h"
 #include "tcuNullContextFactory.hpp"
 #include "util/test_utils.h"
@@ -79,6 +80,47 @@ ANGLEPlatform::ANGLEPlatform(angle::LogErrorFunc logErrorFunc)
     }
 #endif
 
+#if (DE_OS == DE_OS_OSX) || (DE_OS == DE_OS_IOS)
+    {
+        std::vector<eglw::EGLAttrib> glAttribs = initAttribs(EGL_PLATFORM_ANGLE_TYPE_METAL_ANGLE);
+
+        auto *glFactory = new ANGLENativeDisplayFactory("angle-metal", "ANGLE Metal Display",
+                                                        glAttribs, &mEvents);
+        m_nativeDisplayFactoryRegistry.registerFactory(glFactory);
+
+        // Simulate low spec metal devices with most of features missing:
+        static angle::PlatformMethods platformMethods;
+        platformMethods.overrideFeaturesMtl = [](angle::PlatformMethods *platform,
+                                                 angle::FeaturesMtl *featuresMtl) {
+            featuresMtl->overrideFeatures({"has_base_vertex_instanced_draw"}, false);
+            featuresMtl->overrideFeatures({"has_non_uniform_dispatch"}, false);
+            featuresMtl->overrideFeatures({"has_stencil_output"}, false);
+            featuresMtl->overrideFeatures({"allow_msaa_store_and_resolve"}, false);
+            featuresMtl->overrideFeatures({"allow_runtime_sampler_compare_mode"}, false);
+            featuresMtl->overrideFeatures({"allow_buffer_read_write"}, false);
+            featuresMtl->overrideFeatures({"break_render_pass_is_cheap"}, false);
+            featuresMtl->overrideFeatures({"emulate_depth_range_mapping"}, true);
+        };
+        bool platformAttribExist = false;
+        for (size_t i = 0; i < glAttribs.size(); ++i)
+        {
+            if (glAttribs[i] == EGL_PLATFORM_ANGLE_PLATFORM_METHODS_ANGLEX)
+            {
+                glAttribs[i + 1]    = reinterpret_cast<EGLAttrib>(&platformMethods);
+                platformAttribExist = true;
+            }
+        }
+        if (!platformAttribExist)
+        {
+            glAttribs.push_back(EGL_PLATFORM_ANGLE_PLATFORM_METHODS_ANGLEX);
+            glAttribs.push_back(reinterpret_cast<EGLAttrib>(&platformMethods));
+        }
+        glFactory = new ANGLENativeDisplayFactory(
+            "angle-metal-low-spec", "ANGLE Metal Display (Low Spec)", glAttribs, &mEvents);
+        m_nativeDisplayFactoryRegistry.registerFactory(glFactory);
+    }
+#endif
+
     {
         std::vector<eglw::EGLAttrib> glAttribs = initAttribs(EGL_PLATFORM_ANGLE_TYPE_OPENGL_ANGLE);
 
@@ -103,16 +145,6 @@ ANGLEPlatform::ANGLEPlatform(angle::LogErrorFunc logErrorFunc)
             EGL_PLATFORM_ANGLE_TYPE_VULKAN_ANGLE, EGL_PLATFORM_ANGLE_DEVICE_TYPE_SWIFTSHADER_ANGLE);
         m_nativeDisplayFactoryRegistry.registerFactory(new ANGLENativeDisplayFactory(
             "angle-swiftshader", "ANGLE SwiftShader Display", swsAttribs, &mEvents));
-    }
-#endif
-
-#if (DE_OS == DE_OS_OSX)
-    {
-        std::vector<eglw::EGLAttrib> mtlAttribs = initAttribs(EGL_PLATFORM_ANGLE_TYPE_METAL_ANGLE);
-
-        auto *mtlFactory = new ANGLENativeDisplayFactory("angle-metal", "ANGLE Metal Display",
-                                                         mtlAttribs, &mEvents);
-        m_nativeDisplayFactoryRegistry.registerFactory(mtlFactory);
     }
 #endif
 

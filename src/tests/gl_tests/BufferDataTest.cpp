@@ -576,8 +576,9 @@ void main()
 // this could incorrectly pass.
 TEST_P(BufferDataTestES3, MapBufferRangeUnsynchronizedBit)
 {
-    // We can currently only control the behavior of the Vulkan backend's synchronizing operation's
-    ANGLE_SKIP_TEST_IF(!IsVulkan());
+    // We can currently only control the behavior of the Vulkan/Metal backend's synchronizing
+    // operation's
+    ANGLE_SKIP_TEST_IF(!IsVulkan() && !IsMetal());
 
     const size_t numElements = 10;
     std::vector<uint8_t> srcData(numElements);
@@ -600,10 +601,23 @@ TEST_P(BufferDataTestES3, MapBufferRangeUnsynchronizedBit)
     glBindBuffer(GL_COPY_WRITE_BUFFER, dstBuffer);
     ASSERT_GL_NO_ERROR();
 
-    glBufferData(GL_COPY_READ_BUFFER, srcData.size(), srcData.data(), GL_STATIC_DRAW);
+    glBufferData(GL_COPY_READ_BUFFER, srcData.size() + 4, nullptr, GL_STATIC_DRAW);
+    glBufferSubData(GL_COPY_READ_BUFFER, 0, srcData.size(), srcData.data());
     ASSERT_GL_NO_ERROR();
     glBufferData(GL_COPY_WRITE_BUFFER, dstData.size(), dstData.data(), GL_STATIC_READ);
     ASSERT_GL_NO_ERROR();
+
+    if (IsMetal())
+    {
+        // The Metal back-end only does GPU side copy if either source or destination is being used
+        // by GPU. So force GPU usage of source buffer by using dummy glReadPixels()
+        glBindBuffer(GL_COPY_READ_BUFFER, 0);
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, srcBuffer);
+        glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE,
+                     reinterpret_cast<void *>(srcData.size()));
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+        glBindBuffer(GL_COPY_READ_BUFFER, srcBuffer);
+    }
 
     glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, 0, 0, numElements);
 
@@ -675,6 +689,58 @@ TEST_P(BufferDataTest, MapBufferOES)
     ASSERT_NE(nullptr, readMapPtr);
     ASSERT_GL_NO_ERROR();
     std::vector<uint8_t> actualData(data.size());
+    memcpy(actualData.data(), readMapPtr, data.size());
+    glUnmapBufferOES(GL_ARRAY_BUFFER);
+
+    EXPECT_EQ(data, actualData);
+}
+
+// Same as MapBufferOES but using GL_DYNAMIC_DRAW
+TEST_P(BufferDataTest, MapBufferOESDynamic)
+{
+    if (!IsGLExtensionEnabled("GL_EXT_map_buffer_range"))
+    {
+        // Needed for test validation.
+        return;
+    }
+
+    std::vector<uint8_t> data(1024);
+    FillVectorWithRandomUBytes(&data);
+
+    GLBuffer buffer;
+    glBindBuffer(GL_ARRAY_BUFFER, buffer.get());
+    glBufferData(GL_ARRAY_BUFFER, data.size(), nullptr, GL_DYNAMIC_DRAW);
+
+    // Validate that other map flags don't work.
+    void *badMapPtr = glMapBufferOES(GL_ARRAY_BUFFER, GL_MAP_READ_BIT);
+    EXPECT_EQ(nullptr, badMapPtr);
+    EXPECT_GL_ERROR(GL_INVALID_ENUM);
+
+    // Map and write.
+    void *mapPtr = glMapBufferOES(GL_ARRAY_BUFFER, GL_WRITE_ONLY_OES);
+    ASSERT_NE(nullptr, mapPtr);
+    ASSERT_GL_NO_ERROR();
+    memcpy(mapPtr, data.data(), data.size());
+    glUnmapBufferOES(GL_ARRAY_BUFFER);
+
+    // Validate data with EXT_map_buffer_range
+    void *readMapPtr = glMapBufferRangeEXT(GL_ARRAY_BUFFER, 0, data.size(), GL_MAP_READ_BIT_EXT);
+    ASSERT_NE(nullptr, readMapPtr);
+    ASSERT_GL_NO_ERROR();
+    std::vector<uint8_t> actualData(data.size());
+    memcpy(actualData.data(), readMapPtr, data.size());
+    glUnmapBufferOES(GL_ARRAY_BUFFER);
+
+    EXPECT_EQ(data, actualData);
+
+    // Validate again with different data
+    FillVectorWithRandomUBytes(&data);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, data.size(), data.data());
+
+    readMapPtr = glMapBufferRangeEXT(GL_ARRAY_BUFFER, 0, data.size(), GL_MAP_READ_BIT_EXT);
+    ASSERT_NE(nullptr, readMapPtr);
+    ASSERT_GL_NO_ERROR();
+    actualData.resize(data.size());
     memcpy(actualData.data(), readMapPtr, data.size());
     glUnmapBufferOES(GL_ARRAY_BUFFER);
 

@@ -94,9 +94,10 @@ using APIInfo = std::pair<const char *, GPUTestConfig::API>;
 constexpr APIInfo kEGLDisplayAPIs[] = {
     {"angle-d3d9", GPUTestConfig::kAPID3D9},
     {"angle-d3d11", GPUTestConfig::kAPID3D11},
+    {"angle-metal", GPUTestConfig::kAPIMetal},
+    {"angle-metal-low-spec", GPUTestConfig::kAPIMetal},
     {"angle-gl", GPUTestConfig::kAPIGLDesktop},
     {"angle-gles", GPUTestConfig::kAPIGLES},
-    {"angle-metal", GPUTestConfig::kAPIMetal},
     {"angle-null", GPUTestConfig::kAPIUnknown},
     {"angle-swiftshader", GPUTestConfig::kAPISwiftShader},
     {"angle-vulkan", GPUTestConfig::kAPIVulkan},
@@ -120,7 +121,9 @@ const char *GetDefaultAPIName()
 {
 #if defined(ANGLE_PLATFORM_WINDOWS)
     return "angle-d3d11";
-#elif defined(ANGLE_PLATFORM_APPLE) || defined(ANGLE_PLATFORM_LINUX)
+#elif defined(ANGLE_PLATFORM_APPLE)
+    return "angle-metal";
+#elif defined(ANGLE_PLATFORM_LINUX)
     return "angle-gl";
 #elif defined(ANGLE_PLATFORM_ANDROID)
     return "angle-gles";

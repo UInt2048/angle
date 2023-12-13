@@ -556,6 +556,7 @@ def update_filters(service, spreadsheet_id, headers, info, spreadsheet):
         LOGGER.info('Updating sheet filters...')
         batch_update(service, spreadsheet_id, updates)
 
+
 # Populates the headers with any missing/desired rows based on the info struct, and calls
 # batch update to update the corresponding sheets if necessary.
 def update_headers(service, spreadsheet_id, headers, info):
@@ -651,6 +652,7 @@ def generate_duplicate_formula_helper(headers):
     else:
         # Final result needs to be prepended with =
         return "=" + formula
+
 
 # Uses the list of headers and the info struct to come up with a list of values for each step
 # from the latest builds.

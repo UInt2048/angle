@@ -909,6 +909,88 @@ TEST_P(StateChangeTest, VertexBufferUpdatedAfterDraw)
 }
 
 // Test that switching VAOs keeps the disabled "current value" attributes up-to-date.
+// OES_vertex_array_object version.
+TEST_P(StateChangeTest, VertexArrayObjectAndDisabledAttributes)
+{
+    ANGLE_SKIP_TEST_IF(!IsGLExtensionEnabled("GL_OES_vertex_array_object"));
+
+    constexpr char kSingleVS[] = "attribute vec4 position; void main() { gl_Position = position; }";
+    constexpr char kSingleFS[] = "void main() { gl_FragColor = vec4(1, 0, 0, 1); }";
+    ANGLE_GL_PROGRAM(singleProgram, kSingleVS, kSingleFS);
+
+    constexpr char kDualVS[] =
+        "attribute vec4 position;\n"
+        "attribute vec4 color;\n"
+        "varying vec4 varyColor;\n"
+        "void main()\n"
+        "{\n"
+        "    gl_Position = position;\n"
+        "    varyColor = color;\n"
+        "}";
+    constexpr char kDualFS[] =
+        "precision mediump float;\n"
+        "varying vec4 varyColor;\n"
+        "void main()\n"
+        "{\n"
+        "    gl_FragColor = varyColor;\n"
+        "}";
+    ANGLE_GL_PROGRAM(dualProgram, kDualVS, kDualFS);
+    GLint positionLocation = glGetAttribLocation(dualProgram, "position");
+    ASSERT_NE(-1, positionLocation);
+    GLint colorLocation = glGetAttribLocation(dualProgram, "color");
+    ASSERT_NE(-1, colorLocation);
+
+    GLint singlePositionLocation = glGetAttribLocation(singleProgram, "position");
+    ASSERT_NE(-1, singlePositionLocation);
+
+    glUseProgram(singleProgram);
+
+    // Initialize position vertex buffer.
+    const auto &quadVertices = GetQuadVertices();
+
+    GLBuffer vertexBuffer;
+    glBindBuffer(GL_ARRAY_BUFFER, vertexBuffer);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(Vector3) * 6, quadVertices.data(), GL_STATIC_DRAW);
+
+    // Initialize a VAO. Draw with single program.
+    GLVertexArrayOES vertexArray;
+    glBindVertexArrayOES(vertexArray);
+    glBindBuffer(GL_ARRAY_BUFFER, vertexBuffer);
+    glVertexAttribPointer(singlePositionLocation, 3, GL_FLOAT, GL_FALSE, 0, nullptr);
+    glEnableVertexAttribArray(singlePositionLocation);
+
+    // Should draw red.
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    ASSERT_GL_NO_ERROR();
+    EXPECT_PIXEL_COLOR_EQ(0, 0, GLColor::red);
+
+    // Draw with a green buffer attribute, without the VAO.
+    glBindVertexArrayOES(0);
+    glUseProgram(dualProgram);
+    glVertexAttribPointer(positionLocation, 3, GL_FLOAT, GL_FALSE, 0, nullptr);
+    glEnableVertexAttribArray(positionLocation);
+
+    std::vector<GLColor> greenColors(6, GLColor::green);
+    GLBuffer greenBuffer;
+    glBindBuffer(GL_ARRAY_BUFFER, greenBuffer);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(GLColor) * 6, greenColors.data(), GL_STATIC_DRAW);
+
+    glVertexAttribPointer(colorLocation, 4, GL_UNSIGNED_BYTE, GL_FALSE, 4, nullptr);
+    glEnableVertexAttribArray(colorLocation);
+
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    ASSERT_GL_NO_ERROR();
+    EXPECT_PIXEL_COLOR_EQ(0, 0, GLColor::green);
+
+    // Re-bind VAO and try to draw with different program, without changing state.
+    // Should draw black since current value is not initialized.
+    glBindVertexArrayOES(vertexArray);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    ASSERT_GL_NO_ERROR();
+    EXPECT_PIXEL_COLOR_EQ(0, 0, GLColor::black);
+}
+
+// Test that switching VAOs keeps the disabled "current value" attributes up-to-date.
 TEST_P(StateChangeTestES3, VertexArrayObjectAndDisabledAttributes)
 {
     constexpr char kSingleVS[] = "attribute vec4 position; void main() { gl_Position = position; }";
@@ -1098,6 +1180,7 @@ TEST_P(StateChangeTestES3, RedefineTransformFeedbackBuffer)
 {
     // http://anglebug.com/4092
     ANGLE_SKIP_TEST_IF(IsVulkan());
+
     // Create the most simple program possible - simple a passthrough for a float attribute.
     constexpr char kVertexShader[] = R"(#version 300 es
 in float valueIn;
@@ -3976,7 +4059,7 @@ void main()
 // Tests negative API state change cases with Transform Feedback bindings.
 TEST_P(WebGL2ValidationStateChangeTest, TransformFeedbackNegativeAPI)
 {
-    ANGLE_SKIP_TEST_IF(IsAMD() && IsOSX());
+    ANGLE_SKIP_TEST_IF(IsOpenGL() && IsAMD() && IsOSX());
 
     // TODO(anglebug.com/4533) This fails after the upgrade to the 26.20.100.7870 driver.
     ANGLE_SKIP_TEST_IF(IsWindows() && IsIntel() && IsVulkan());
@@ -4147,7 +4230,7 @@ void main()
 // Tests that we retain the correct draw mode settings with transform feedback changes.
 TEST_P(ValidationStateChangeTest, TransformFeedbackDrawModes)
 {
-    ANGLE_SKIP_TEST_IF(IsAMD() && IsOSX());
+    ANGLE_SKIP_TEST_IF(IsOpenGL() && IsAMD() && IsOSX());
 
     std::vector<std::string> tfVaryings = {"gl_Position"};
     ANGLE_GL_PROGRAM_TRANSFORM_FEEDBACK(program, essl3_shaders::vs::Simple(),

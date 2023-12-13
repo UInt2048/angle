@@ -12,14 +12,19 @@
 #include <TargetConditionals.h>
 
 #include "common/debug.h"
+#include "libANGLE/TransformFeedback.h"
 #include "libANGLE/renderer/metal/BufferMtl.h"
 #include "libANGLE/renderer/metal/CompilerMtl.h"
 #include "libANGLE/renderer/metal/DisplayMtl.h"
 #include "libANGLE/renderer/metal/FrameBufferMtl.h"
 #include "libANGLE/renderer/metal/ProgramMtl.h"
+#include "libANGLE/renderer/metal/QueryMtl.h"
 #include "libANGLE/renderer/metal/RenderBufferMtl.h"
+#include "libANGLE/renderer/metal/SamplerMtl.h"
 #include "libANGLE/renderer/metal/ShaderMtl.h"
+#include "libANGLE/renderer/metal/SyncMtl.h"
 #include "libANGLE/renderer/metal/TextureMtl.h"
+#include "libANGLE/renderer/metal/TransformFeedbackMtl.h"
 #include "libANGLE/renderer/metal/VertexArrayMtl.h"
 #include "libANGLE/renderer/metal/mtl_command_buffer.h"
 #include "libANGLE/renderer/metal/mtl_format_utils.h"
@@ -30,40 +35,26 @@ namespace rx
 
 namespace
 {
-#if TARGET_OS_OSX
-// Unlimited triangle fan buffers
-constexpr uint32_t kMaxTriFanLineLoopBuffersPerFrame = 0;
-#else
-// Allow up to 10 buffers for trifan/line loop generation without stalling the GPU.
-constexpr uint32_t kMaxTriFanLineLoopBuffersPerFrame = 10;
-#endif
+constexpr uint32_t kMaxTriFanClientBuffersCachedPerFrame = 10;
 
-angle::Result TriangleFanBoundCheck(ContextMtl *context, size_t numTris)
-{
-    bool indexCheck =
-        (numTris > std::numeric_limits<unsigned int>::max() / (sizeof(unsigned int) * 3));
-    ANGLE_CHECK(context, !indexCheck,
-                "Failed to create a scratch index buffer for GL_TRIANGLE_FAN, "
-                "too many indices required.",
-                GL_OUT_OF_MEMORY);
-    return angle::Result::Continue;
-}
-
-angle::Result GetTriangleFanIndicesCount(ContextMtl *context,
-                                         GLsizei vetexCount,
-                                         uint32_t *numElemsOut)
-{
-    size_t numTris = vetexCount - 2;
-    ANGLE_TRY(TriangleFanBoundCheck(context, numTris));
-    size_t numIndices = numTris * 3;
-    ANGLE_CHECK(context, numIndices <= std::numeric_limits<uint32_t>::max(),
-                "Failed to create a scratch index buffer for GL_TRIANGLE_FAN, "
-                "too many indices required.",
-                GL_OUT_OF_MEMORY);
-
-    *numElemsOut = static_cast<uint32_t>(numIndices);
-    return angle::Result::Continue;
-}
+#define ANGLE_MTL_XFB_DRAW(DRAW_PROC)                                                       \
+    if (!mState.isTransformFeedbackActiveUnpaused())                                        \
+    {                                                                                       \
+        /* Normal draw call */                                                              \
+        DRAW_PROC(false);                                                                   \
+    }                                                                                       \
+    else                                                                                    \
+    {                                                                                       \
+        /* First pass: write to XFB buffers in vertex shader, fragment shader inactive */   \
+        DRAW_PROC(true);                                                                    \
+        if (!mState.isRasterizerDiscardEnabled())                                           \
+        {                                                                                   \
+            /* Second pass: full rasterization: vertex shader + fragment shader are active. \
+               Vertex shader writes to stage output but won't write to XFB buffers */       \
+            invalidateRenderPipeline();                                                     \
+            DRAW_PROC(false);                                                               \
+        }                                                                                   \
+    }
 
 angle::Result AllocateTriangleFanBufferFromPool(ContextMtl *context,
                                                 GLsizei vertexCount,
@@ -73,10 +64,9 @@ angle::Result AllocateTriangleFanBufferFromPool(ContextMtl *context,
                                                 uint32_t *numElemsOut)
 {
     uint32_t numIndices;
-    ANGLE_TRY(GetTriangleFanIndicesCount(context, vertexCount, &numIndices));
+    ANGLE_TRY(mtl::GetTriangleFanIndicesCount(context, vertexCount, &numIndices));
 
     size_t offset;
-    pool->releaseInFlightBuffers(context);
     ANGLE_TRY(pool->allocate(context, numIndices * sizeof(uint32_t), nullptr, bufferOut, &offset,
                              nullptr));
 
@@ -86,19 +76,113 @@ angle::Result AllocateTriangleFanBufferFromPool(ContextMtl *context,
     return angle::Result::Continue;
 }
 
+angle::Result AllocateLineLoopBufferFromPool(ContextMtl *context,
+                                             GLsizei indicesToReserve,
+                                             mtl::BufferPool *pool,
+                                             mtl::BufferRef *bufferOut,
+                                             uint32_t *offsetOut)
+{
+    size_t offset;
+    ANGLE_TRY(pool->allocate(context, indicesToReserve * sizeof(uint32_t), nullptr, bufferOut,
+                             &offset, nullptr));
+
+    *offsetOut = static_cast<uint32_t>(offset);
+
+    return angle::Result::Continue;
+}
+
 bool NeedToInvertDepthRange(float near, float far)
 {
     return near > far;
 }
+
+bool IsTransformFeedbackOnly(const gl::State &glState)
+{
+    return glState.isTransformFeedbackActiveUnpaused() && glState.isRasterizerDiscardEnabled();
+}
+
+std::string ConvertMarkerToCpp(GLsizei length, const char *marker)
+{
+    std::string cppString;
+    if (length == 0)
+    {
+        cppString = marker;
+    }
+    else
+    {
+        cppString.assign(marker, length);
+    }
+    return cppString;
+}
+
+// This class constructs line loop's last segment buffer inside begin() method
+// and perform the draw of the line loop's last segment inside destructor
+class LineLoopLastSegmentHelper
+{
+  public:
+    LineLoopLastSegmentHelper() {}
+
+    ~LineLoopLastSegmentHelper()
+    {
+        if (!mLineLoopIndexBufferPool)
+        {
+            return;
+        }
+
+        // Draw last segment of line loop here
+        mtl::RenderCommandEncoder *encoder = mContextMtl->getRenderCommandEncoder();
+        ASSERT(encoder);
+        encoder->drawIndexed(MTLPrimitiveTypeLine, 2, MTLIndexTypeUInt32, mLineLoopIndexBufferPool,
+                             0);
+    }
+
+    angle::Result begin(const gl::Context *context,
+                        mtl::BufferPool *indexBufferPool,
+                        GLint firstVertex,
+                        GLsizei vertexOrIndexCount,
+                        gl::DrawElementsType indexTypeOrNone,
+                        const void *indices)
+    {
+        mContextMtl = mtl::GetImpl(context);
+
+        ANGLE_TRY(indexBufferPool->allocate(mContextMtl, 2 * sizeof(uint32_t), nullptr,
+                                            &mLineLoopIndexBufferPool, nullptr, nullptr));
+
+        if (indexTypeOrNone == gl::DrawElementsType::InvalidEnum)
+        {
+            ANGLE_TRY(mContextMtl->getDisplay()->getUtils().generateLineLoopLastSegment(
+                mContextMtl, firstVertex, firstVertex + vertexOrIndexCount - 1,
+                mLineLoopIndexBufferPool, 0));
+        }
+        else
+        {
+            ASSERT(firstVertex == 0);
+            ANGLE_TRY(
+                mContextMtl->getDisplay()->getUtils().generateLineLoopLastSegmentFromElementsArray(
+                    mContextMtl,
+                    {indexTypeOrNone, vertexOrIndexCount, indices, mLineLoopIndexBufferPool, 0}));
+        }
+
+        ANGLE_TRY(indexBufferPool->commit(mContextMtl));
+
+        return angle::Result::Continue;
+    }
+
+  private:
+    ContextMtl *mContextMtl = nullptr;
+    mtl::BufferRef mLineLoopIndexBufferPool;
+};
+
 }  // namespace
 
 ContextMtl::ContextMtl(const gl::State &state, gl::ErrorSet *errorSet, DisplayMtl *display)
     : ContextImpl(state, errorSet),
       mtl::Context(display),
       mCmdBuffer(&display->cmdQueue()),
-      mRenderEncoder(&mCmdBuffer),
+      mRenderEncoder(&mCmdBuffer, mOcclusionQueryPool),
       mBlitEncoder(&mCmdBuffer),
-      mComputeEncoder(&mCmdBuffer)
+      mComputeEncoder(&mCmdBuffer),
+      mTriFanClientIndexBufferCache(kMaxTriFanClientBuffersCachedPerFrame)
 {}
 
 ContextMtl::~ContextMtl() {}
@@ -108,19 +192,60 @@ angle::Result ContextMtl::initialize()
     mBlendDesc.reset();
     mDepthStencilDesc.reset();
 
-    mTriFanIndexBuffer.initialize(this, 0, mtl::kIndexBufferOffsetAlignment,
-                                  kMaxTriFanLineLoopBuffersPerFrame);
-    mLineLoopIndexBuffer.initialize(this, 0, 2 * sizeof(uint32_t),
-                                    kMaxTriFanLineLoopBuffersPerFrame);
-    mLineLoopIndexBuffer.setAlwaysAllocateNewBuffer(true);
+    mClientIndexBufferPool.initialize(this, 0, mtl::kIndexBufferOffsetAlignment);
+
+    mTriFanIndexBufferPool.initialize(this, 0, mtl::kIndexBufferOffsetAlignment);
+    mTriFanClientIndexBufferPool.initialize(this, 0, mtl::kIndexBufferOffsetAlignment);
+    mLineLoopIndexBufferPool.initialize(this, 0, mtl::kIndexBufferOffsetAlignment);
+    mLineLoopLastSegmentIndexBufferPool.initialize(this, 2 * sizeof(uint32_t),
+                                                   mtl::kIndexBufferOffsetAlignment);
+
+    ANGLE_TRY(mOcclusionQueryPool.initialize(this));
 
     return angle::Result::Continue;
 }
 
 void ContextMtl::onDestroy(const gl::Context *context)
 {
-    mTriFanIndexBuffer.destroy(this);
-    mLineLoopIndexBuffer.destroy(this);
+    mClientIndexBufferPool.destroy(this);
+
+    mTriFanClientIndexBufferCache.Clear();
+    mTriFanIndexBufferPool.destroy(this);
+    mTriFanClientIndexBufferPool.destroy(this);
+    mLineLoopIndexBufferPool.destroy(this);
+    mLineLoopLastSegmentIndexBufferPool.destroy(this);
+    mOcclusionQueryPool.destroy(this);
+
+    mTriFanArraysIndexBuffer            = nullptr;
+    mTriFanArraysIndexBufferFirstVertex = 0;
+    mTriFanArraysIndexBufferOffset      = 0;
+
+    mIncompleteTextures.onDestroy(context);
+    mIncompleteTexturesInitialized = false;
+
+    mDummyXFBRenderTexture = nullptr;
+}
+
+angle::Result ContextMtl::ensureIncompleteTexturesCreated(const gl::Context *context)
+{
+    if (ANGLE_LIKELY(mIncompleteTexturesInitialized))
+    {
+        return angle::Result::Continue;
+    }
+    constexpr gl::TextureType supportedTextureTypes[] = {
+        gl::TextureType::_2D, gl::TextureType::_2DArray, gl::TextureType::_3D,
+        gl::TextureType::CubeMap, gl::TextureType::Rectangle};
+    for (gl::TextureType texType : supportedTextureTypes)
+    {
+        gl::Texture *texture;
+        ANGLE_TRY(mIncompleteTextures.getIncompleteTexture(context, texType, nullptr, &texture));
+
+        TextureMtl *textureMtl                      = mtl::GetImpl(texture);
+        textureMtl->getNativeTexture()->get().label = @"IncompleteTexture";
+    }
+    mIncompleteTexturesInitialized = true;
+
+    return angle::Result::Continue;
 }
 
 // Flush and finish.
@@ -141,8 +266,10 @@ angle::Result ContextMtl::drawTriFanArraysWithBaseVertex(const gl::Context *cont
                                                          GLsizei count,
                                                          GLsizei instances)
 {
+    ASSERT((getDisplay()->getFeatures().hasBaseVertexInstancedDraw.enabled));
+
     uint32_t genIndicesCount;
-    ANGLE_TRY(GetTriangleFanIndicesCount(this, count, &genIndicesCount));
+    ANGLE_TRY(mtl::GetTriangleFanIndicesCount(this, count, &genIndicesCount));
 
     size_t indexBufferSize = genIndicesCount * sizeof(uint32_t);
     // We can reuse the previously generated index buffer if it has more than enough indices
@@ -153,11 +280,14 @@ angle::Result ContextMtl::drawTriFanArraysWithBaseVertex(const gl::Context *cont
         ANGLE_TRY(
             mtl::Buffer::MakeBuffer(this, indexBufferSize, nullptr, &mTriFanArraysIndexBuffer));
         ANGLE_TRY(getDisplay()->getUtils().generateTriFanBufferFromArrays(
-            context, {0, static_cast<uint32_t>(count), mTriFanArraysIndexBuffer, 0}));
+            this, {0, static_cast<uint32_t>(count), mTriFanArraysIndexBuffer, 0}));
     }
 
+    ASSERT(!getState().isTransformFeedbackActiveUnpaused());
+
     ANGLE_TRY(setupDraw(context, gl::PrimitiveMode::TriangleFan, first, count, instances,
-                        gl::DrawElementsType::InvalidEnum, reinterpret_cast<const void *>(0)));
+                        gl::DrawElementsType::InvalidEnum, reinterpret_cast<const void *>(0),
+                        false));
 
     // Draw with the zero starting index buffer, shift the vertex index using baseVertex instanced
     // draw:
@@ -173,22 +303,37 @@ angle::Result ContextMtl::drawTriFanArraysLegacy(const gl::Context *context,
                                                  GLsizei instances)
 {
     // Legacy method is only used for GPU lacking instanced draw capabilities.
-    ASSERT(instances == 1);
-
-    mtl::BufferRef genIdxBuffer;
-    uint32_t genIdxBufferOffset;
     uint32_t genIndicesCount;
-    ANGLE_TRY(AllocateTriangleFanBufferFromPool(this, count, &mTriFanIndexBuffer, &genIdxBuffer,
-                                                &genIdxBufferOffset, &genIndicesCount));
-    ANGLE_TRY(getDisplay()->getUtils().generateTriFanBufferFromArrays(
-        context, {static_cast<uint32_t>(first), static_cast<uint32_t>(count), genIdxBuffer,
-                  genIdxBufferOffset}));
+
+    ANGLE_TRY(mtl::GetTriangleFanIndicesCount(this, count, &genIndicesCount));
+
+    // We can reuse the previously generated index buffer if it has more than enough indices
+    // data already and the first vertex is the same.
+    if (mTriFanArraysIndexBuffer == nullptr ||
+        mTriFanArraysIndexBuffer->size() < genIndicesCount * sizeof(uint32_t) ||
+        mTriFanArraysIndexBufferFirstVertex != first)
+    {
+        // Re-generate a new index buffer
+        ANGLE_TRY(AllocateTriangleFanBufferFromPool(
+            this, count, &mTriFanIndexBufferPool, &mTriFanArraysIndexBuffer,
+            &mTriFanArraysIndexBufferOffset, &genIndicesCount));
+        ANGLE_TRY(getDisplay()->getUtils().generateTriFanBufferFromArrays(
+            this, {static_cast<uint32_t>(first), static_cast<uint32_t>(count),
+                   mTriFanArraysIndexBuffer, mTriFanArraysIndexBufferOffset}));
+
+        ANGLE_TRY(mTriFanIndexBufferPool.commit(this));
+
+        mTriFanArraysIndexBufferFirstVertex = first;
+    }
+
+    ASSERT(!getState().isTransformFeedbackActiveUnpaused());
 
     ANGLE_TRY(setupDraw(context, gl::PrimitiveMode::TriangleFan, first, count, instances,
-                        gl::DrawElementsType::InvalidEnum, reinterpret_cast<const void *>(0)));
+                        gl::DrawElementsType::InvalidEnum, reinterpret_cast<const void *>(0),
+                        false));
 
-    mRenderEncoder.drawIndexed(MTLPrimitiveTypeTriangle, genIndicesCount, MTLIndexTypeUInt32,
-                               genIdxBuffer, genIdxBufferOffset);
+    execDrawIndexedInstanced(MTLPrimitiveTypeTriangle, genIndicesCount, MTLIndexTypeUInt32,
+                             mTriFanArraysIndexBuffer, mTriFanArraysIndexBufferOffset, instances);
 
     return angle::Result::Continue;
 }
@@ -206,6 +351,53 @@ angle::Result ContextMtl::drawTriFanArrays(const gl::Context *context,
         return drawTriFanArraysWithBaseVertex(context, first, count, instances);
     }
     return drawTriFanArraysLegacy(context, first, count, instances);
+}
+
+angle::Result ContextMtl::drawLineLoopArraysNonInstanced(const gl::Context *context,
+                                                         GLint first,
+                                                         GLsizei count)
+{
+    // Generate line loop's last segment. It will be rendered when this function exits.
+    LineLoopLastSegmentHelper lineloopHelper;
+    // Line loop helper needs to generate last segment indices before rendering command encoder
+    // starts.
+    ANGLE_TRY(lineloopHelper.begin(context, &mLineLoopLastSegmentIndexBufferPool, first, count,
+                                   gl::DrawElementsType::InvalidEnum, nullptr));
+
+    return drawArraysImpl(context, gl::PrimitiveMode::LineStrip, first, count, 0);
+}
+
+angle::Result ContextMtl::drawLineLoopArrays(const gl::Context *context,
+                                             GLint first,
+                                             GLsizei count,
+                                             GLsizei instances)
+{
+    if (instances <= 1)
+    {
+        return drawLineLoopArraysNonInstanced(context, first, count);
+    }
+
+    mtl::BufferRef genIdxBuffer;
+    uint32_t genIdxBufferOffset;
+    uint32_t genIndicesCount = count + 1;
+
+    ANGLE_TRY(AllocateLineLoopBufferFromPool(this, genIndicesCount, &mLineLoopIndexBufferPool,
+                                             &genIdxBuffer, &genIdxBufferOffset));
+    ANGLE_TRY(getDisplay()->getUtils().generateLineLoopBufferFromArrays(
+        this, {static_cast<uint32_t>(first), static_cast<uint32_t>(count), genIdxBuffer,
+               genIdxBufferOffset}));
+
+    ANGLE_TRY(mLineLoopIndexBufferPool.commit(this));
+
+    ASSERT(!getState().isTransformFeedbackActiveUnpaused());
+
+    ANGLE_TRY(setupDraw(context, gl::PrimitiveMode::LineLoop, first, count, instances,
+                        gl::DrawElementsType::InvalidEnum, nullptr, false));
+
+    execDrawIndexedInstanced(MTLPrimitiveTypeLineStrip, genIndicesCount, MTLIndexTypeUInt32,
+                             genIdxBuffer, genIdxBufferOffset, instances);
+
+    return angle::Result::Continue;
 }
 
 angle::Result ContextMtl::drawArraysImpl(const gl::Context *context,
@@ -226,21 +418,28 @@ angle::Result ContextMtl::drawArraysImpl(const gl::Context *context,
     {
         return drawTriFanArrays(context, first, count, instanceCount);
     }
+    else if (mode == gl::PrimitiveMode::LineLoop)
+    {
+        return drawLineLoopArrays(context, first, count, instanceCount);
+    }
 
     MTLPrimitiveType mtlType = mtl::GetPrimitiveType(mode);
 
-    ANGLE_TRY(setupDraw(context, mode, first, count, instances, gl::DrawElementsType::InvalidEnum,
-                        nullptr));
+#define DRAW_GENERIC_ARRAY(xfbPass)                                                                \
+    ANGLE_TRY(setupDraw(context, mode, first, count, instances, gl::DrawElementsType::InvalidEnum, \
+                        nullptr, xfbPass));                                                        \
+                                                                                                   \
+    if (instances == 0)                                                                            \
+    {                                                                                              \
+        /* This method is called from normal drawArrays() */                                       \
+        mRenderEncoder.draw(mtlType, first, count);                                                \
+    }                                                                                              \
+    else                                                                                           \
+    {                                                                                              \
+        ANGLE_TRY(execDrawInstanced(mtlType, first, count, instanceCount));                        \
+    }
 
-    if (instances == 0)
-    {
-        // This method is called from normal drawArrays()
-        mRenderEncoder.draw(mtlType, first, count);
-    }
-    else
-    {
-        mRenderEncoder.drawInstanced(mtlType, first, count, instanceCount);
-    }
+    ANGLE_MTL_XFB_DRAW(DRAW_GENERIC_ARRAY)
 
     return angle::Result::Continue;
 }
@@ -286,26 +485,115 @@ angle::Result ContextMtl::drawTriFanElements(const gl::Context *context,
     if (count > 3)
     {
         mtl::BufferRef genIdxBuffer;
-        uint32_t genIdxBufferOffset;
-        uint32_t genIndicesCount;
-        ANGLE_TRY(AllocateTriangleFanBufferFromPool(this, count, &mTriFanIndexBuffer, &genIdxBuffer,
-                                                    &genIdxBufferOffset, &genIndicesCount));
+        uint32_t genIdxBufferOffset = 0;
+        uint32_t genIndicesCount    = 0;
 
-        ANGLE_TRY(getDisplay()->getUtils().generateTriFanBufferFromElementsArray(
-            context, {type, count, indices, genIdxBuffer, genIdxBufferOffset}));
+        const gl::VertexArray *vertexArray = getState().getVertexArray();
+        const gl::Buffer *elementBuffer    = vertexArray->getElementArrayBuffer();
 
-        ANGLE_TRY(mTriFanIndexBuffer.commit(this));
+        mtl::ClientIndexArrayKey clientIndicesKey;
+        if (!elementBuffer)
+        {
+            // If indices is from client memory, check if it is already cached.
+            clientIndicesKey.wrap(indices, type, count);
 
-        ANGLE_TRY(
-            setupDraw(context, gl::PrimitiveMode::TriangleFan, 0, count, instances, type, indices));
+            mtl::ClientIndexBufferCache::const_iterator ite =
+                mTriFanClientIndexBufferCache.Peek(clientIndicesKey);
+            if (ite != mTriFanClientIndexBufferCache.end())
+            {
+                // Found in cache, reuse the index buffer.
+                genIdxBuffer       = ite->second.buffer;
+                genIdxBufferOffset = static_cast<uint32_t>(ite->second.offset);
 
-        mRenderEncoder.drawIndexedInstanced(MTLPrimitiveTypeTriangle, genIndicesCount,
-                                            MTLIndexTypeUInt32, genIdxBuffer, genIdxBufferOffset,
-                                            instances);
+                ANGLE_TRY(mtl::GetTriangleFanIndicesCount(this, count, &genIndicesCount));
+            }
+        }
+
+        if (!genIdxBuffer)
+        {
+            bool primitiveRestart = getState().isPrimitiveRestartEnabled();
+            ANGLE_TRY(AllocateTriangleFanBufferFromPool(this, count, &mTriFanClientIndexBufferPool,
+                                                        &genIdxBuffer, &genIdxBufferOffset,
+                                                        &genIndicesCount));
+
+            ANGLE_TRY(getDisplay()->getUtils().generateTriFanBufferFromElementsArray(
+                this, {type, count, indices, genIdxBuffer, genIdxBufferOffset, primitiveRestart}));
+
+            ANGLE_TRY(mTriFanClientIndexBufferPool.commit(this));
+
+            if (clientIndicesKey.valid())
+            {
+                // Cache the generated buffer
+                mtl::ClientArrayBufferCachePayload entry = {genIdxBuffer, genIdxBufferOffset};
+                mTriFanClientIndexBufferCache.Put(clientIndicesKey, std::move(entry));
+            }
+        }
+
+        ANGLE_TRY(setupDraw(context, gl::PrimitiveMode::TriangleFan, 0, count, instances, type,
+                            indices, false));
+
+        execDrawIndexedInstanced(MTLPrimitiveTypeTriangle, genIndicesCount, MTLIndexTypeUInt32,
+                                 genIdxBuffer, genIdxBufferOffset, instances);
 
         return angle::Result::Continue;
     }  // if (count > 3)
     return drawElementsInstanced(context, gl::PrimitiveMode::Triangles, count, type, indices,
+                                 instances);
+}
+
+angle::Result ContextMtl::drawLineLoopElementsNonInstancedNoPrimitiveRestart(
+    const gl::Context *context,
+    GLsizei count,
+    gl::DrawElementsType type,
+    const void *indices)
+{
+    // Generate line loop's last segment. It will be rendered when this function exits.
+    LineLoopLastSegmentHelper lineloopHelper;
+    // Line loop helper needs to generate index before rendering command encoder starts.
+    ANGLE_TRY(lineloopHelper.begin(context, &mLineLoopLastSegmentIndexBufferPool, 0, count, type,
+                                   indices));
+
+    return drawElementsImpl(context, gl::PrimitiveMode::LineStrip, count, type, indices, 0);
+}
+
+angle::Result ContextMtl::drawLineLoopElements(const gl::Context *context,
+                                               GLsizei count,
+                                               gl::DrawElementsType type,
+                                               const void *indices,
+                                               GLsizei instances)
+{
+    if (count >= 2)
+    {
+        bool primitiveRestart = getState().isPrimitiveRestartEnabled();
+        if (instances <= 1 && !primitiveRestart)
+        {
+            // Non instanced draw and no primitive restart, just use faster version.
+            return drawLineLoopElementsNonInstancedNoPrimitiveRestart(context, count, type,
+                                                                      indices);
+        }
+
+        mtl::BufferRef genIdxBuffer;
+        uint32_t genIdxBufferOffset;
+        uint32_t reservedIndices = count * 2;
+        uint32_t genIndicesCount;
+        ANGLE_TRY(AllocateLineLoopBufferFromPool(this, reservedIndices, &mLineLoopIndexBufferPool,
+                                                 &genIdxBuffer, &genIdxBufferOffset));
+
+        ANGLE_TRY(getDisplay()->getUtils().generateLineLoopBufferFromElementsArray(
+            this, {type, count, indices, genIdxBuffer, genIdxBufferOffset, primitiveRestart},
+            &genIndicesCount));
+
+        ANGLE_TRY(mLineLoopIndexBufferPool.commit(this));
+
+        ANGLE_TRY(setupDraw(context, gl::PrimitiveMode::LineLoop, 0, count, instances, type,
+                            indices, false));
+
+        execDrawIndexedInstanced(MTLPrimitiveTypeLineStrip, genIndicesCount, MTLIndexTypeUInt32,
+                                 genIdxBuffer, genIdxBufferOffset, instances);
+
+        return angle::Result::Continue;
+    }  // if (count >= 2)
+    return drawElementsInstanced(context, gl::PrimitiveMode::Lines, count, type, indices,
                                  instances);
 }
 
@@ -328,6 +616,10 @@ angle::Result ContextMtl::drawElementsImpl(const gl::Context *context,
     {
         return drawTriFanElements(context, count, type, indices, instanceCount);
     }
+    else if (mode == gl::PrimitiveMode::LineLoop)
+    {
+        return drawLineLoopElements(context, count, type, indices, instanceCount);
+    }
 
     mtl::BufferRef idxBuffer;
     size_t convertedOffset             = 0;
@@ -339,7 +631,7 @@ angle::Result ContextMtl::drawElementsImpl(const gl::Context *context,
     ASSERT(idxBuffer);
     ASSERT((convertedOffset % mtl::kIndexBufferOffsetAlignment) == 0);
 
-    ANGLE_TRY(setupDraw(context, mode, 0, count, instances, type, indices));
+    ANGLE_TRY(setupDraw(context, mode, 0, count, instances, type, indices, false));
 
     MTLPrimitiveType mtlType = mtl::GetPrimitiveType(mode);
 
@@ -353,8 +645,8 @@ angle::Result ContextMtl::drawElementsImpl(const gl::Context *context,
     else
     {
         // Instanced draw
-        mRenderEncoder.drawIndexedInstanced(mtlType, count, mtlIdxType, idxBuffer, convertedOffset,
-                                            instanceCount);
+        execDrawIndexedInstanced(mtlType, count, mtlIdxType, idxBuffer, convertedOffset,
+                                 instanceCount);
     }
 
     return angle::Result::Continue;
@@ -429,9 +721,7 @@ angle::Result ContextMtl::drawRangeElements(const gl::Context *context,
                                             gl::DrawElementsType type,
                                             const void *indices)
 {
-    // NOTE(hqle): ES 3.0
-    UNIMPLEMENTED();
-    return angle::Result::Stop;
+    return drawElementsImpl(context, mode, count, type, indices, 0);
 }
 
 angle::Result ContextMtl::drawRangeElementsBaseVertex(const gl::Context *context,
@@ -466,6 +756,68 @@ angle::Result ContextMtl::drawElementsIndirect(const gl::Context *context,
     return angle::Result::Stop;
 }
 
+angle::Result ContextMtl::execDrawInstanced(MTLPrimitiveType primitiveType,
+                                            uint32_t vertexStart,
+                                            uint32_t vertexCount,
+                                            uint32_t instances)
+{
+    if (getDisplay()->getFeatures().hasBaseVertexInstancedDraw.enabled)
+    {
+        mRenderEncoder.drawInstanced(primitiveType, vertexStart, vertexCount, instances);
+    }
+    else
+    {
+        mRenderEncoder.draw(primitiveType, vertexStart, vertexCount);
+        for (uint32_t inst = 1; inst < instances; ++inst)
+        {
+            mDriverUniforms.emulatedInstanceID = inst;
+
+            ANGLE_TRY(fillDriverXFBUniforms(vertexStart, vertexCount, inst));
+
+            mRenderEncoder.setVertexData(mDriverUniforms, mtl::kDriverUniformsBindingIndex);
+
+            mVertexArray->emulateInstanceDrawStep(&mRenderEncoder, inst);
+
+            mRenderEncoder.draw(primitiveType, vertexStart, vertexCount);
+        }
+        // Reset instance ID to zero
+        mVertexArray->emulateInstanceDrawStep(&mRenderEncoder, 0);
+    }
+
+    return angle::Result::Continue;
+}
+
+void ContextMtl::execDrawIndexedInstanced(MTLPrimitiveType primitiveType,
+                                          uint32_t indexCount,
+                                          MTLIndexType indexType,
+                                          const mtl::BufferRef &indexBuffer,
+                                          size_t bufferOffset,
+                                          uint32_t instances)
+{
+    if (getDisplay()->getFeatures().hasBaseVertexInstancedDraw.enabled)
+    {
+        mRenderEncoder.drawIndexedInstanced(primitiveType, indexCount, indexType, indexBuffer,
+                                            bufferOffset, instances);
+    }
+    else
+    {
+        mRenderEncoder.drawIndexed(primitiveType, indexCount, indexType, indexBuffer, bufferOffset);
+        for (uint32_t inst = 1; inst < instances; ++inst)
+        {
+            mDriverUniforms.emulatedInstanceID = inst;
+
+            mRenderEncoder.setVertexData(mDriverUniforms, mtl::kDriverUniformsBindingIndex);
+
+            mVertexArray->emulateInstanceDrawStep(&mRenderEncoder, inst);
+
+            mRenderEncoder.drawIndexed(primitiveType, indexCount, indexType, indexBuffer,
+                                       bufferOffset);
+        }
+        // Reset instance ID to zero
+        mVertexArray->emulateInstanceDrawStep(&mRenderEncoder, 0);
+    }
+}
+
 // Device loss
 gl::GraphicsResetStatus ContextMtl::getResetStatus()
 {
@@ -485,16 +837,19 @@ std::string ContextMtl::getRendererDescription() const
 // EXT_debug_marker
 angle::Result ContextMtl::insertEventMarker(GLsizei length, const char *marker)
 {
+    mCmdBuffer.insertDebugSign(ConvertMarkerToCpp(length, marker));
     return angle::Result::Continue;
 }
 
 angle::Result ContextMtl::pushGroupMarker(GLsizei length, const char *marker)
 {
+    mCmdBuffer.pushDebugGroup(ConvertMarkerToCpp(length, marker));
     return angle::Result::Continue;
 }
 
 angle::Result ContextMtl::popGroupMarker()
 {
+    mCmdBuffer.popDebugGroup();
     return angle::Result::Continue;
 }
 
@@ -518,6 +873,9 @@ angle::Result ContextMtl::syncState(const gl::Context *context,
                                     const gl::State::DirtyBits &bitMask)
 {
     const gl::State &glState = context->getState();
+
+    // Initialize incomplete texture set.
+    ANGLE_TRY(ensureIncompleteTexturesCreated(context));
 
     for (size_t dirtyBit : dirtyBits)
     {
@@ -555,23 +913,28 @@ angle::Result ContextMtl::syncState(const gl::Context *context,
                 invalidateRenderPipeline();
                 break;
             case gl::State::DIRTY_BIT_COLOR_MASK:
+            {
                 mBlendDesc.updateWriteMask(glState.getBlendState());
                 invalidateRenderPipeline();
-                break;
+
+                FramebufferMtl *framebufferMtl = mtl::GetImpl(glState.getDrawFramebuffer());
+                ANGLE_TRY(framebufferMtl->onColorMaskChanged(context, mBlendDesc.writeMask));
+            }
+            break;
             case gl::State::DIRTY_BIT_SAMPLE_ALPHA_TO_COVERAGE_ENABLED:
-                // NOTE(hqle): MSAA support
+                invalidateRenderPipeline();
                 break;
             case gl::State::DIRTY_BIT_SAMPLE_COVERAGE_ENABLED:
-                // NOTE(hqle): MSAA support
+                invalidateRenderPipeline();
                 break;
             case gl::State::DIRTY_BIT_SAMPLE_COVERAGE:
-                // NOTE(hqle): MSAA support
+                invalidateDriverUniforms();
                 break;
             case gl::State::DIRTY_BIT_SAMPLE_MASK_ENABLED:
-                // NOTE(hqle): MSAA support
+                // NOTE(hqle): 3.1 MSAA support
                 break;
             case gl::State::DIRTY_BIT_SAMPLE_MASK:
-                // NOTE(hqle): MSAA support
+                // NOTE(hqle): 3.1 MSAA support
                 break;
             case gl::State::DIRTY_BIT_DEPTH_TEST_ENABLED:
                 mDepthStencilDesc.updateDepthTestEnabled(glState.getDepthStencilState());
@@ -631,13 +994,13 @@ angle::Result ContextMtl::syncState(const gl::Context *context,
                 updateDepthBias(glState);
                 break;
             case gl::State::DIRTY_BIT_RASTERIZER_DISCARD_ENABLED:
-                // NOTE(hqle): ES 3.0 feature.
+                mDirtyBits.set(DIRTY_BIT_RASTERIZER_DISCARD);
                 break;
             case gl::State::DIRTY_BIT_LINE_WIDTH:
                 // Do nothing
                 break;
             case gl::State::DIRTY_BIT_PRIMITIVE_RESTART_ENABLED:
-                // NOTE(hqle): ES 3.0 feature.
+                updatePrimitiRestart(glState);
                 break;
             case gl::State::DIRTY_BIT_CLEAR_COLOR:
                 mClearColor.red   = glState.getColorClearValue().red;
@@ -697,7 +1060,7 @@ angle::Result ContextMtl::syncState(const gl::Context *context,
                 // NOTE(hqle): ES 3.0 feature.
                 break;
             case gl::State::DIRTY_BIT_UNIFORM_BUFFER_BINDINGS:
-                // NOTE(hqle): ES 3.0 feature.
+                mDirtyBits.set(DIRTY_BIT_UNIFORM_BUFFERS_BINDING);
                 break;
             case gl::State::DIRTY_BIT_ATOMIC_COUNTER_BUFFER_BINDING:
                 break;
@@ -706,7 +1069,7 @@ angle::Result ContextMtl::syncState(const gl::Context *context,
                 invalidateCurrentTextures();
                 break;
             case gl::State::DIRTY_BIT_MULTISAMPLING:
-                // NOTE(hqle): MSAA feature.
+                // NOTE(hqle): MSAA on/off.
                 break;
             case gl::State::DIRTY_BIT_SAMPLE_ALPHA_TO_ONE:
                 // NOTE(hqle): this is part of EXT_multisample_compatibility.
@@ -801,7 +1164,7 @@ ProgramImpl *ContextMtl::createProgram(const gl::ProgramState &state)
 // Framebuffer creation
 FramebufferImpl *ContextMtl::createFramebuffer(const gl::FramebufferState &state)
 {
-    return new FramebufferMtl(state, false);
+    return new FramebufferMtl(state, false, nullptr);
 }
 
 // Texture creation
@@ -831,35 +1194,28 @@ VertexArrayImpl *ContextMtl::createVertexArray(const gl::VertexArrayState &state
 // Query and Fence creation
 QueryImpl *ContextMtl::createQuery(gl::QueryType type)
 {
-    // NOTE(hqle): ES 3.0
-    UNIMPLEMENTED();
-    return nullptr;
+    return new QueryMtl(type);
 }
 FenceNVImpl *ContextMtl::createFenceNV()
 {
-    UNIMPLEMENTED();
-    return nullptr;
+    return new FenceNVMtl();
 }
 SyncImpl *ContextMtl::createSync()
 {
-    UNIMPLEMENTED();
-    return nullptr;
+    return new SyncMtl();
 }
 
 // Transform Feedback creation
 TransformFeedbackImpl *ContextMtl::createTransformFeedback(const gl::TransformFeedbackState &state)
 {
     // NOTE(hqle): ES 3.0
-    UNIMPLEMENTED();
-    return nullptr;
+    return new TransformFeedbackMtl(state);
 }
 
 // Sampler object creation
 SamplerImpl *ContextMtl::createSampler(const gl::SamplerState &state)
 {
-    // NOTE(hqle): ES 3.0
-    UNIMPLEMENTED();
-    return nullptr;
+    return new SamplerMtl(state);
 }
 
 // Program Pipeline object creation
@@ -985,12 +1341,27 @@ void ContextMtl::invalidateRenderPipeline()
     mDirtyBits.set(DIRTY_BIT_RENDER_PIPELINE);
 }
 
-const MTLClearColor &ContextMtl::getClearColorValue() const
+const mtl::ClearColorValue &ContextMtl::getClearColorValue() const
 {
     return mClearColor;
 }
+
+MTLColorWriteMask ContextMtl::getClearColorMask() const
+{
+    return mBlendDesc.writeMask;
+}
+
 MTLColorWriteMask ContextMtl::getColorMask() const
 {
+    if (mState.isWebGL())
+    {
+        // For WebGL, we store write mask as part of framebuffer's state
+        FramebufferMtl *fb = mtl::GetImpl(mState.getDrawFramebuffer());
+        if (fb)
+        {
+            return fb->getLastSavedColorMask();
+        }
+    }
     return mBlendDesc.writeMask;
 }
 float ContextMtl::getClearDepthValue() const
@@ -1016,6 +1387,11 @@ const mtl::Format &ContextMtl::getPixelFormat(angle::FormatID angleFormatId) con
     return getDisplay()->getPixelFormat(angleFormatId);
 }
 
+const mtl::FormatCaps &ContextMtl::getNativeFormatCaps(MTLPixelFormat mtlFormat) const
+{
+    return getDisplay()->getNativeFormatCaps(mtlFormat);
+}
+
 // See mtl::FormatTable::getVertexFormat()
 const mtl::VertexFormat &ContextMtl::getVertexFormat(angle::FormatID angleFormatId,
                                                      bool tightlyPacked) const
@@ -1023,9 +1399,25 @@ const mtl::VertexFormat &ContextMtl::getVertexFormat(angle::FormatID angleFormat
     return getDisplay()->getVertexFormat(angleFormatId, tightlyPacked);
 }
 
+angle::Result ContextMtl::getIncompleteTexture(const gl::Context *context,
+                                               gl::TextureType type,
+                                               gl::Texture **textureOut)
+{
+    return mIncompleteTextures.getIncompleteTexture(context, type, nullptr, textureOut);
+}
+
 void ContextMtl::endEncoding(mtl::RenderCommandEncoder *encoder)
 {
+    // End any pending visibility query in the render pass
+    if (mOcclusionQuery)
+    {
+        disableActiveOcclusionQueryInRenderPass();
+    }
+
     encoder->endEncoding();
+
+    // Resolve visibility results
+    mOcclusionQueryPool.resolveVisibilityResults(this);
 }
 
 void ContextMtl::endEncoding(bool forceSaveRenderPassContent)
@@ -1039,7 +1431,7 @@ void ContextMtl::endEncoding(bool forceSaveRenderPassContent)
             mRenderEncoder.setDepthStencilStoreAction(MTLStoreActionStore, MTLStoreActionStore);
         }
 
-        mRenderEncoder.endEncoding();
+        endEncoding(&mRenderEncoder);
     }
 
     if (mBlitEncoder.valid())
@@ -1055,44 +1447,39 @@ void ContextMtl::endEncoding(bool forceSaveRenderPassContent)
 
 void ContextMtl::flushCommandBufer()
 {
-    if (!mCmdBuffer.valid())
+    if (!mCmdBuffer.ready())
     {
         return;
     }
 
     endEncoding(true);
     mCmdBuffer.commit();
+
+    releaseInFlightBuffers();
 }
 
 void ContextMtl::present(const gl::Context *context, id<CAMetalDrawable> presentationDrawable)
 {
-    ensureCommandBufferValid();
+    ensureCommandBufferReady();
 
-    // Always discard default FBO's depth stencil buffers at the end of the frame:
-    if (mDrawFramebufferIsDefault && hasStartedRenderPass(mDrawFramebuffer))
+    FramebufferMtl *currentframebuffer = mtl::GetImpl(getState().getDrawFramebuffer());
+    if (currentframebuffer)
     {
-        constexpr GLenum dsAttachments[] = {GL_DEPTH, GL_STENCIL};
-        (void)mDrawFramebuffer->invalidate(context, 2, dsAttachments);
-
-        endEncoding(false);
-
-        // Reset discard flag by notify framebuffer that a new render pass has started.
-        mDrawFramebuffer->onStartedDrawingToFrameBuffer(context);
+        currentframebuffer->onFrameEnd(context);
     }
 
     endEncoding(false);
     mCmdBuffer.present(presentationDrawable);
     mCmdBuffer.commit();
+
+    releaseInFlightBuffers();
 }
 
 angle::Result ContextMtl::finishCommandBuffer()
 {
     flushCommandBufer();
 
-    if (mCmdBuffer.valid())
-    {
-        mCmdBuffer.finish();
-    }
+    mCmdBuffer.finish();
 
     return angle::Result::Continue;
 }
@@ -1101,11 +1488,6 @@ bool ContextMtl::hasStartedRenderPass(const mtl::RenderPassDesc &desc)
 {
     return mRenderEncoder.valid() &&
            mRenderEncoder.renderPassDesc().equalIgnoreLoadStoreOptions(desc);
-}
-
-bool ContextMtl::hasStartedRenderPass(FramebufferMtl *framebuffer)
-{
-    return framebuffer && hasStartedRenderPass(framebuffer->getRenderPassDesc(this));
 }
 
 // Get current render encoder
@@ -1119,16 +1501,6 @@ mtl::RenderCommandEncoder *ContextMtl::getRenderCommandEncoder()
     return &mRenderEncoder;
 }
 
-mtl::RenderCommandEncoder *ContextMtl::getCurrentFramebufferRenderCommandEncoder()
-{
-    if (!mDrawFramebuffer)
-    {
-        return nullptr;
-    }
-
-    return getRenderCommandEncoder(mDrawFramebuffer->getRenderPassDesc(this));
-}
-
 mtl::RenderCommandEncoder *ContextMtl::getRenderCommandEncoder(const mtl::RenderPassDesc &desc)
 {
     if (hasStartedRenderPass(desc))
@@ -1138,7 +1510,7 @@ mtl::RenderCommandEncoder *ContextMtl::getRenderCommandEncoder(const mtl::Render
 
     endEncoding(false);
 
-    ensureCommandBufferValid();
+    ensureCommandBufferReady();
 
     // Need to re-apply everything on next draw call.
     mDirtyBits.set();
@@ -1146,36 +1518,48 @@ mtl::RenderCommandEncoder *ContextMtl::getRenderCommandEncoder(const mtl::Render
     return &mRenderEncoder.restart(desc);
 }
 
-// Utilities to quickly create render command enconder to a specific texture:
+// Utilities to quickly create render command encoder to a specific texture:
 // The previous content of texture will be loaded if clearColor is not provided
-mtl::RenderCommandEncoder *ContextMtl::getRenderCommandEncoder(
-    const mtl::TextureRef &textureTarget,
-    const gl::ImageIndex &index,
-    const Optional<MTLClearColor> &clearColor)
+mtl::RenderCommandEncoder *ContextMtl::getRenderCommandEncoder(const mtl::TextureRef &textureTarget,
+                                                               const gl::ImageIndex &index)
 {
     ASSERT(textureTarget && textureTarget->valid());
 
     mtl::RenderPassDesc rpDesc;
 
-    rpDesc.colorAttachments[0].texture = textureTarget;
-    rpDesc.colorAttachments[0].level   = index.getLevelIndex();
-    rpDesc.colorAttachments[0].slice   = index.hasLayer() ? index.getLayerIndex() : 0;
-    rpDesc.numColorAttachments         = 1;
+    rpDesc.colorAttachments[0].targetTexture      = textureTarget;
+    rpDesc.colorAttachments[0].targetLevel        = index.getLevelIndex();
+    rpDesc.colorAttachments[0].targetSliceOrDepth = index.hasLayer() ? index.getLayerIndex() : 0;
+    rpDesc.numColorAttachments                    = 1;
+    rpDesc.sampleCount                            = textureTarget->samples();
+
+    return getRenderCommandEncoder(rpDesc);
+}
+
+mtl::RenderCommandEncoder *ContextMtl::getRenderCommandEncoder(
+    const RenderTargetMtl &renderTarget,
+    const Optional<MTLClearColor> &clearColor)
+{
+    ASSERT(renderTarget.getTexture());
+
+    mtl::RenderPassDesc rpDesc;
+    renderTarget.toRenderPassAttachmentDesc(&rpDesc.colorAttachments[0]);
+    rpDesc.numColorAttachments = 1;
+    rpDesc.sampleCount         = renderTarget.getRenderSamples();
 
     if (clearColor.valid())
     {
         rpDesc.colorAttachments[0].loadAction = MTLLoadActionClear;
-        rpDesc.colorAttachments[0].clearColor =
-            mtl::EmulatedAlphaClearColor(clearColor.value(), textureTarget->getColorWritableMask());
+        rpDesc.colorAttachments[0].clearColor = mtl::EmulatedAlphaClearColor(
+            clearColor.value(), renderTarget.getTexture()->getColorWritableMask());
     }
 
     return getRenderCommandEncoder(rpDesc);
 }
 // The previous content of texture will be loaded
-mtl::RenderCommandEncoder *ContextMtl::getRenderCommandEncoder(const mtl::TextureRef &textureTarget,
-                                                               const gl::ImageIndex &index)
+mtl::RenderCommandEncoder *ContextMtl::getRenderCommandEncoder(const RenderTargetMtl &renderTarget)
 {
-    return getRenderCommandEncoder(textureTarget, index, Optional<MTLClearColor>());
+    return getRenderCommandEncoder(renderTarget, Optional<MTLClearColor>());
 }
 
 mtl::BlitCommandEncoder *ContextMtl::getBlitCommandEncoder()
@@ -1187,7 +1571,7 @@ mtl::BlitCommandEncoder *ContextMtl::getBlitCommandEncoder()
 
     endEncoding(true);
 
-    ensureCommandBufferValid();
+    ensureCommandBufferReady();
 
     return &mBlitEncoder.restart();
 }
@@ -1201,19 +1585,32 @@ mtl::ComputeCommandEncoder *ContextMtl::getComputeCommandEncoder()
 
     endEncoding(true);
 
-    ensureCommandBufferValid();
+    ensureCommandBufferReady();
 
     return &mComputeEncoder.restart();
 }
 
-void ContextMtl::ensureCommandBufferValid()
+void ContextMtl::ensureCommandBufferReady()
 {
-    if (!mCmdBuffer.valid())
+    if (!mCmdBuffer.ready())
     {
         mCmdBuffer.restart();
     }
 
-    ASSERT(mCmdBuffer.valid());
+    ASSERT(mCmdBuffer.ready());
+}
+
+void ContextMtl::releaseInFlightBuffers()
+{
+    mClientIndexBufferPool.releaseInFlightBuffers(this);
+    mLineLoopIndexBufferPool.releaseInFlightBuffers(this);
+    mLineLoopLastSegmentIndexBufferPool.releaseInFlightBuffers(this);
+    mTriFanIndexBufferPool.releaseInFlightBuffers(this);
+    mTriFanClientIndexBufferPool.releaseInFlightBuffers(this);
+
+    // At this point the buffers in mTriFanClientIndexBufferPool could be re-used.
+    // So clear the cache.
+    mTriFanClientIndexBufferCache.Clear();
 }
 
 void ContextMtl::updateViewport(FramebufferMtl *framebufferMtl,
@@ -1221,6 +1618,13 @@ void ContextMtl::updateViewport(FramebufferMtl *framebufferMtl,
                                 float nearPlane,
                                 float farPlane)
 {
+    if (getDisplay()->getFeatures().emulateDepthRangeMappingInShader.enabled)
+    {
+        // Disable depth range in viewport, we do the mapping in shader itself.
+        nearPlane = 0;
+        farPlane  = 1;
+    }
+
     mViewport = mtl::GetViewport(viewport, framebufferMtl->getState().getDimensions().height,
                                  framebufferMtl->flipY(), nearPlane, farPlane);
     mDirtyBits.set(DIRTY_BIT_VIEWPORT);
@@ -1230,6 +1634,13 @@ void ContextMtl::updateViewport(FramebufferMtl *framebufferMtl,
 
 void ContextMtl::updateDepthRange(float nearPlane, float farPlane)
 {
+    if (getDisplay()->getFeatures().emulateDepthRangeMappingInShader.enabled)
+    {
+        // Disable depth range in viewport, we do the mapping in shader itself.
+        nearPlane = 0;
+        farPlane  = 1;
+    }
+
     if (NeedToInvertDepthRange(nearPlane, farPlane))
     {
         // We also need to invert the depth in shader later by using scale value stored in driver
@@ -1316,28 +1727,177 @@ void ContextMtl::updateDrawFrameBufferBinding(const gl::Context *context)
 {
     const gl::State &glState = getState();
 
-    mDrawFramebuffer          = mtl::GetImpl(glState.getDrawFramebuffer());
-    mDrawFramebufferIsDefault = mDrawFramebuffer->getState().isDefault();
+    mDrawFramebuffer = mtl::GetImpl(glState.getDrawFramebuffer());
 
     mDrawFramebuffer->onStartedDrawingToFrameBuffer(context);
 
-    onDrawFrameBufferChange(context, mDrawFramebuffer);
+    onDrawFrameBufferChangedState(context, mDrawFramebuffer, true);
 }
 
-void ContextMtl::onDrawFrameBufferChange(const gl::Context *context, FramebufferMtl *framebuffer)
+void ContextMtl::onDrawFrameBufferChangedState(const gl::Context *context,
+                                               FramebufferMtl *framebuffer,
+                                               bool renderPassChanged)
 {
     const gl::State &glState = getState();
     ASSERT(framebuffer == mtl::GetImpl(glState.getDrawFramebuffer()));
-
-    mDirtyBits.set(DIRTY_BIT_DRAW_FRAMEBUFFER);
 
     updateViewport(framebuffer, glState.getViewport(), glState.getNearPlane(),
                    glState.getFarPlane());
     updateFrontFace(glState);
     updateScissor(glState);
 
-    // Need to re-apply state to RenderCommandEncoder
-    invalidateState(context);
+    if (renderPassChanged)
+    {
+        // End any render encoding using the old render pass.
+        endEncoding(false);
+        // Need to re-apply state to RenderCommandEncoder
+        invalidateState(context);
+    }
+    else
+    {
+        // Invalidate current pipeline only.
+        invalidateRenderPipeline();
+    }
+}
+
+void ContextMtl::onBackbufferResized(const gl::Context *context, WindowSurfaceMtl *backbuffer)
+{
+    const gl::State &glState    = getState();
+    FramebufferMtl *framebuffer = mtl::GetImpl(glState.getDrawFramebuffer());
+    if (framebuffer->getAttachedBackbuffer() != backbuffer)
+    {
+        return;
+    }
+
+    onDrawFrameBufferChangedState(context, framebuffer, true);
+}
+
+angle::Result ContextMtl::ensureOcclusionQueryPoolCapacity()
+{
+    if (!mOcclusionQueryPool.canAllocateQueryOffset())
+    {
+        // No more room to allocate new query offset, end current render pass.
+        endEncoding(true);
+
+        ANGLE_TRY(mOcclusionQueryPool.reserveForMaxPossibleQueryOffsets(this));
+    }
+
+    return angle::Result::Continue;
+}
+
+angle::Result ContextMtl::onOcclusionQueryBegan(const gl::Context *context, QueryMtl *query)
+{
+    ASSERT(mOcclusionQuery == nullptr);
+    mOcclusionQuery = query;
+
+    ANGLE_TRY(ensureOcclusionQueryPoolCapacity());
+
+    if (mRenderEncoder.valid())
+    {
+        // if render pass has started, start the query in the encoder
+        return startOcclusionQueryInRenderPass(query, true);
+    }
+    else
+    {
+        query->resetVisibilityResult(this);
+    }
+
+    return angle::Result::Continue;
+}
+void ContextMtl::onOcclusionQueryEnded(const gl::Context *context, QueryMtl *query)
+{
+    ASSERT(mOcclusionQuery == query);
+
+    if (mRenderEncoder.valid())
+    {
+        // if render pass has started, end the query in the encoder
+        disableActiveOcclusionQueryInRenderPass();
+    }
+
+    mOcclusionQuery = nullptr;
+}
+void ContextMtl::onOcclusionQueryDestroyed(const gl::Context *context, QueryMtl *query)
+{
+    if (query->getAllocatedVisibilityOffsets().empty())
+    {
+        return;
+    }
+    if (mOcclusionQuery == query)
+    {
+        onOcclusionQueryEnded(context, query);
+    }
+    mOcclusionQueryPool.deallocateQueryOffset(this, query);
+}
+
+void ContextMtl::disableActiveOcclusionQueryInRenderPass()
+{
+    if (!mOcclusionQuery || mOcclusionQuery->getAllocatedVisibilityOffsets().empty())
+    {
+        return;
+    }
+
+    ASSERT(mRenderEncoder.valid());
+    mRenderEncoder.setVisibilityResultMode(MTLVisibilityResultModeDisabled,
+                                           mOcclusionQuery->getAllocatedVisibilityOffsets().back());
+}
+
+angle::Result ContextMtl::restartActiveOcclusionQueryInRenderPass()
+{
+    if (!mOcclusionQuery || mOcclusionQuery->getAllocatedVisibilityOffsets().empty())
+    {
+        return angle::Result::Continue;
+    }
+
+    ANGLE_TRY(ensureOcclusionQueryPoolCapacity());
+
+    return startOcclusionQueryInRenderPass(mOcclusionQuery, false);
+}
+
+angle::Result ContextMtl::startOcclusionQueryInRenderPass(QueryMtl *query, bool clearOldValue)
+{
+    ASSERT(mRenderEncoder.valid());
+
+    ANGLE_TRY(mOcclusionQueryPool.allocateQueryOffset(this, query, clearOldValue));
+
+    mRenderEncoder.setVisibilityResultMode(MTLVisibilityResultModeBoolean,
+                                           query->getAllocatedVisibilityOffsets().back());
+
+    // We need to mark the query's buffer as being written in this command buffer now. Since the
+    // actual writing is deferred until the render pass ends and user could try to read the query
+    // result before the render pass ends.
+    mCmdBuffer.setWriteDependency(query->getVisibilityResultBuffer());
+
+    return angle::Result::Continue;
+}
+
+void ContextMtl::queueEventSignal(const mtl::SharedEventRef &event, uint64_t value)
+{
+    ensureCommandBufferReady();
+    mCmdBuffer.queueEventSignal(event, value);
+}
+
+void ContextMtl::serverWaitEvent(const mtl::SharedEventRef &event, uint64_t value)
+{
+    ensureCommandBufferReady();
+
+    // Event waiting cannot be encoded if there is active encoder.
+    endEncoding(true);
+
+    mCmdBuffer.serverWaitEvent(event, value);
+}
+
+void ContextMtl::onTransformFeedbackActive(const gl::Context *context, TransformFeedbackMtl *xfb)
+{
+    // NOTE(hqle): We have to end current render pass to enable synchronization before XFB
+    // buffers could be used as vertex input. Consider a better approach.
+    endEncoding(true);
+}
+
+void ContextMtl::onTransformFeedbackInactive(const gl::Context *context, TransformFeedbackMtl *xfb)
+{
+    // NOTE(hqle): We have to end current render pass to enable synchronization before XFB
+    // buffers could be used as vertex input. Consider a better approach.
+    endEncoding(true);
 }
 
 void ContextMtl::updateProgramExecutable(const gl::Context *context)
@@ -1356,6 +1916,12 @@ void ContextMtl::updateVertexArray(const gl::Context *context)
     mVertexArray             = mtl::GetImpl(glState.getVertexArray());
     invalidateDefaultAttributes(context->getStateCache().getActiveDefaultAttribsMask());
     invalidateRenderPipeline();
+}
+
+void ContextMtl::updatePrimitiRestart(const gl::State &glState)
+{
+    // Need to invalidate client index buffer caches
+    mTriFanClientIndexBufferCache.Clear();
 }
 
 angle::Result ContextMtl::updateDefaultAttribute(size_t attribIndex)
@@ -1381,23 +1947,14 @@ angle::Result ContextMtl::setupDraw(const gl::Context *context,
                                     GLsizei vertexOrIndexCount,
                                     GLsizei instances,
                                     gl::DrawElementsType indexTypeOrNone,
-                                    const void *indices)
+                                    const void *indices,
+                                    bool xfbPass)
 {
     ASSERT(mProgram);
 
     // instances=0 means no instanced draw.
     GLsizei instanceCount = instances ? instances : 1;
 
-    mtl::BufferRef lineLoopLastSegmentIndexBuffer;
-    if (mode == gl::PrimitiveMode::LineLoop)
-    {
-        // Generate line loop last segment before render command encoder is created
-        ANGLE_TRY(genLineLoopLastSegment(context, firstVertex, vertexOrIndexCount, instanceCount,
-                                         indexTypeOrNone, indices,
-                                         &lineLoopLastSegmentIndexBuffer));
-    }
-
-    // Must be called before the render command encoder is started.
     if (context->getStateCache().hasAnyActiveClientAttrib())
     {
         ANGLE_TRY(mVertexArray->updateClientAttribs(context, firstVertex, vertexOrIndexCount,
@@ -1411,6 +1968,20 @@ angle::Result ContextMtl::setupDraw(const gl::Context *context,
         ANGLE_TRY(handleDirtyActiveTextures(context));
     }
 
+    if (mDirtyBits.test(DIRTY_BIT_RASTERIZER_DISCARD))
+    {
+        if (getState().isTransformFeedbackActiveUnpaused())
+        {
+            // If XFB is active we need to reset render pass since we could use a dummy render
+            // target if only XFB is needed.
+            invalidateState(context);
+        }
+        else
+        {
+            invalidateRenderPipeline();
+        }
+    }
+
     if (!mRenderEncoder.valid())
     {
         // re-apply everything
@@ -1419,16 +1990,26 @@ angle::Result ContextMtl::setupDraw(const gl::Context *context,
 
     if (mDirtyBits.test(DIRTY_BIT_DRAW_FRAMEBUFFER))
     {
-        // Start new render command encoder
-        const mtl::RenderPassDesc &rpDesc = mDrawFramebuffer->getRenderPassDesc(this);
-        ANGLE_MTL_TRY(this, getRenderCommandEncoder(rpDesc));
-
-        // re-apply everything
-        invalidateState(context);
+        ANGLE_TRY(handleDirtyRenderPass(context));
     }
 
-    Optional<mtl::RenderPipelineDesc> changedPipelineDesc;
-    ANGLE_TRY(checkIfPipelineChanged(context, mode, &changedPipelineDesc));
+    if (mOcclusionQuery && mOcclusionQueryPool.getNumRenderPassAllocatedQueries() == 0)
+    {
+        // The occlusion query is still active, and a new render pass has started.
+        // We need to continue the querying process in the new render encoder.
+        ANGLE_TRY(startOcclusionQueryInRenderPass(mOcclusionQuery, false));
+    }
+
+    bool changedPipeline;
+    ANGLE_TRY(checkIfPipelineChanged(context, mode, xfbPass, &changedPipeline));
+
+    bool uniformBuffersDirty = false;
+
+    if (IsTransformFeedbackOnly(getState()))
+    {
+        // Filter out unneeded dirty bits
+        filterOutXFBOnlyDirtyBits(context);
+    }
 
     for (size_t bit : mDirtyBits)
     {
@@ -1441,7 +2022,7 @@ angle::Result ContextMtl::setupDraw(const gl::Context *context,
                 ANGLE_TRY(handleDirtyDefaultAttribs(context));
                 break;
             case DIRTY_BIT_DRIVER_UNIFORMS:
-                ANGLE_TRY(handleDirtyDriverUniforms(context));
+                ANGLE_TRY(handleDirtyDriverUniforms(context, firstVertex, vertexOrIndexCount));
                 break;
             case DIRTY_BIT_DEPTH_STENCIL_DESC:
                 ANGLE_TRY(handleDirtyDepthStencilState(context));
@@ -1475,65 +2056,86 @@ angle::Result ContextMtl::setupDraw(const gl::Context *context,
             case DIRTY_BIT_RENDER_PIPELINE:
                 // Already handled. See checkIfPipelineChanged().
                 break;
+            case DIRTY_BIT_UNIFORM_BUFFERS_BINDING:
+                uniformBuffersDirty = true;
+                break;
+            case DIRTY_BIT_RASTERIZER_DISCARD:
+                // Already handled.
+                break;
             default:
                 UNREACHABLE();
                 break;
         }
     }
 
+    if (xfbPass && !mDirtyBits.test(DIRTY_BIT_DRIVER_UNIFORMS))
+    {
+        // If handleDirtyDriverUniforms() was not called and this is XFB pass, we still need to
+        // update XFB related uniforms
+        ANGLE_TRY(
+            fillDriverXFBUniforms(firstVertex, vertexOrIndexCount, /** skippedInstances */ 0));
+        mRenderEncoder.setVertexData(mDriverUniforms, mtl::kDriverUniformsBindingIndex);
+    }
+
     mDirtyBits.reset();
 
-    ANGLE_TRY(mProgram->setupDraw(context, &mRenderEncoder, changedPipelineDesc, textureChanged));
-
-    if (mode == gl::PrimitiveMode::LineLoop)
-    {
-        // Draw last segment of line loop here
-        if (instances == 0)
-        {
-            mRenderEncoder.drawIndexed(MTLPrimitiveTypeLine, 2, MTLIndexTypeUInt32,
-                                       lineLoopLastSegmentIndexBuffer, 0);
-        }
-        else
-        {
-            mRenderEncoder.drawIndexedInstanced(MTLPrimitiveTypeLine, 2, MTLIndexTypeUInt32,
-                                                lineLoopLastSegmentIndexBuffer, 0, instanceCount);
-        }
-    }
+    ANGLE_TRY(mProgram->setupDraw(context, &mRenderEncoder, mRenderPipelineDesc, changedPipeline,
+                                  textureChanged, uniformBuffersDirty));
 
     return angle::Result::Continue;
 }
 
-angle::Result ContextMtl::genLineLoopLastSegment(const gl::Context *context,
-                                                 GLint firstVertex,
-                                                 GLsizei vertexOrIndexCount,
-                                                 GLsizei instanceCount,
-                                                 gl::DrawElementsType indexTypeOrNone,
-                                                 const void *indices,
-                                                 mtl::BufferRef *lastSegmentIndexBufferOut)
+void ContextMtl::filterOutXFBOnlyDirtyBits(const gl::Context *context)
 {
-    mLineLoopIndexBuffer.releaseInFlightBuffers(this);
+    ASSERT(IsTransformFeedbackOnly(getState()));
 
-    mtl::BufferRef newBuffer;
-    ANGLE_TRY(mLineLoopIndexBuffer.allocate(this, 2 * sizeof(uint32_t), nullptr, &newBuffer,
-                                            nullptr, nullptr));
+    ASSERT(mRenderEncoder.renderPassDesc().colorAttachments[0].texture() == mDummyXFBRenderTexture);
 
-    if (indexTypeOrNone == gl::DrawElementsType::InvalidEnum)
+    // In transform feedback only pass, only vertex shader's related states are needed.
+    constexpr size_t kUnneededBits =
+        angle::Bit<size_t>(DIRTY_BIT_DEPTH_STENCIL_DESC) |
+        angle::Bit<size_t>(DIRTY_BIT_DEPTH_BIAS) | angle::Bit<size_t>(DIRTY_BIT_STENCIL_REF) |
+        angle::Bit<size_t>(DIRTY_BIT_BLEND_COLOR) | angle::Bit<size_t>(DIRTY_BIT_VIEWPORT) |
+        angle::Bit<size_t>(DIRTY_BIT_SCISSOR) | angle::Bit<size_t>(DIRTY_BIT_CULL_MODE) |
+        angle::Bit<size_t>(DIRTY_BIT_WINDING);
+
+    mDirtyBits &= ~kUnneededBits;
+}
+
+angle::Result ContextMtl::handleDirtyRenderPass(const gl::Context *context)
+{
+    if (!IsTransformFeedbackOnly(mState))
     {
-        ANGLE_TRY(getDisplay()->getUtils().generateLineLoopLastSegment(
-            context, firstVertex, firstVertex + vertexOrIndexCount - 1, newBuffer, 0));
+        // Start new render command encoder
+        ANGLE_MTL_TRY(this, mDrawFramebuffer->ensureRenderPassStarted(context));
     }
     else
     {
-        // NOTE(hqle): Support drawRangeElements & instanced draw, which means firstVertex has to be
-        // taken into account
-        ASSERT(firstVertex == 0);
-        ANGLE_TRY(getDisplay()->getUtils().generateLineLoopLastSegmentFromElementsArray(
-            context, {indexTypeOrNone, vertexOrIndexCount, indices, newBuffer, 0}));
+        // XFB is active and rasterization is disabled. Use dummy render target.
+        // We currently need to end the render pass when XFB is activated/deactivated so using
+        // a small dummy render target would make the render pass ending very cheap.
+        if (!mDummyXFBRenderTexture)
+        {
+            ANGLE_TRY(mtl::Texture::Make2DTexture(this,
+                                                  getPixelFormat(angle::FormatID::R8G8B8A8_UNORM),
+                                                  1, 1, 1, true, false, &mDummyXFBRenderTexture));
+        }
+        mtl::RenderCommandEncoder *encoder =
+            getRenderCommandEncoder(mDummyXFBRenderTexture, gl::ImageIndex::Make2D(0));
+        encoder->setColorLoadAction(MTLLoadActionDontCare, MTLClearColor(), 0);
+        encoder->setColorStoreAction(MTLStoreActionDontCare);
+
+        // Disable scissor rect out of bound warning.
+        encoder->enableScissorRectOOBWarn(false);
+
+#ifndef NDEBUG
+        encoder->setLabel(@"TransformFeedbackOnlyPass");
+#endif
+        encoder->pushDebugGroup(@"TransformFeedbackOnly");
     }
 
-    ANGLE_TRY(mLineLoopIndexBuffer.commit(this));
-
-    *lastSegmentIndexBufferOut = newBuffer;
+    // re-apply everything
+    invalidateState(context);
 
     return angle::Result::Continue;
 }
@@ -1574,14 +2176,15 @@ angle::Result ContextMtl::handleDirtyDefaultAttribs(const gl::Context *context)
     }
 
     ASSERT(mRenderEncoder.valid());
-    mRenderEncoder.setFragmentData(mDefaultAttributes, mtl::kDefaultAttribsBindingIndex);
     mRenderEncoder.setVertexData(mDefaultAttributes, mtl::kDefaultAttribsBindingIndex);
 
     mDirtyDefaultAttribsMask.reset();
     return angle::Result::Continue;
 }
 
-angle::Result ContextMtl::handleDirtyDriverUniforms(const gl::Context *context)
+angle::Result ContextMtl::handleDirtyDriverUniforms(const gl::Context *context,
+                                                    GLint drawCallFirstVertex,
+                                                    uint32_t verticesPerInstance)
 {
     const gl::Rectangle &glViewport = mState.getViewport();
 
@@ -1599,22 +2202,48 @@ angle::Result ContextMtl::handleDirtyDriverUniforms(const gl::Context *context)
     mDriverUniforms.viewportYScale    = mDrawFramebuffer->flipY() ? -1.0f : 1.0f;
     mDriverUniforms.negViewportYScale = -mDriverUniforms.viewportYScale;
 
+    // gl_ClipDistance
     mDriverUniforms.enabledClipDistances = mState.getEnabledClipDistances().bits();
 
     mDriverUniforms.depthRange[0] = depthRangeNear;
     mDriverUniforms.depthRange[1] = depthRangeFar;
     mDriverUniforms.depthRange[2] = depthRangeDiff;
-    mDriverUniforms.depthRange[3] = NeedToInvertDepthRange(depthRangeNear, depthRangeFar) ? -1 : 1;
 
-    // Fill in a mat2 identity matrix, plus padding
-    mDriverUniforms.preRotation[0] = 1.0f;
-    mDriverUniforms.preRotation[1] = 0.0f;
-    mDriverUniforms.preRotation[2] = 0.0f;
-    mDriverUniforms.preRotation[3] = 0.0f;
-    mDriverUniforms.preRotation[4] = 0.0f;
-    mDriverUniforms.preRotation[5] = 1.0f;
-    mDriverUniforms.preRotation[6] = 0.0f;
-    mDriverUniforms.preRotation[7] = 0.0f;
+    if (NeedToInvertDepthRange(depthRangeNear, depthRangeFar))
+    {
+        mDriverUniforms.depthRange[3] = -1;
+
+        mDriverUniforms.adjustedDepthRange[0] = depthRangeFar;
+        mDriverUniforms.adjustedDepthRange[1] = depthRangeNear;
+        mDriverUniforms.adjustedDepthRange[2] = -depthRangeDiff;
+    }
+    else
+    {
+        mDriverUniforms.depthRange[3] = 1;
+
+        mDriverUniforms.adjustedDepthRange[0] = depthRangeNear;
+        mDriverUniforms.adjustedDepthRange[1] = depthRangeFar;
+        mDriverUniforms.adjustedDepthRange[2] = depthRangeDiff;
+    }
+
+    // NOTE(hqle): preRotation is unused.
+
+    // Sample coverage mask
+    uint32_t sampleBitCount = mDrawFramebuffer->getSamples();
+    uint32_t coverageSampleBitCount =
+        static_cast<uint32_t>(std::round(mState.getSampleCoverageValue() * sampleBitCount));
+    ASSERT(sampleBitCount < 32);
+    uint32_t coverageMask = (1u << coverageSampleBitCount) - 1;
+    uint32_t sampleMask   = (1u << sampleBitCount) - 1;
+    if (mState.getSampleCoverageInvert())
+    {
+        coverageMask = sampleMask & (~coverageMask);
+    }
+    mDriverUniforms.coverageMask       = coverageMask;
+    mDriverUniforms.emulatedInstanceID = 0;
+
+    ANGLE_TRY(
+        fillDriverXFBUniforms(drawCallFirstVertex, verticesPerInstance, /** skippedInstances */ 0));
 
     ASSERT(mRenderEncoder.valid());
     mRenderEncoder.setFragmentData(mDriverUniforms, mtl::kDriverUniformsBindingIndex);
@@ -1623,21 +2252,42 @@ angle::Result ContextMtl::handleDirtyDriverUniforms(const gl::Context *context)
     return angle::Result::Continue;
 }
 
+angle::Result ContextMtl::fillDriverXFBUniforms(GLint drawCallFirstVertex,
+                                                uint32_t verticesPerInstance,
+                                                uint32_t skippedInstances)
+{
+    gl::TransformFeedback *transformFeedback = getState().getCurrentTransformFeedback();
+
+    mDriverUniforms.xfbActiveUnpaused = getState().isTransformFeedbackActiveUnpaused();
+    if (!transformFeedback || !mDriverUniforms.xfbActiveUnpaused)
+    {
+        return angle::Result::Continue;
+    }
+
+    mDriverUniforms.xfbVerticesPerDraw = verticesPerInstance;
+
+    TransformFeedbackMtl *transformFeedbackMtl = mtl::GetImpl(transformFeedback);
+
+    return transformFeedbackMtl->getBufferOffsets(this, mProgram->getState(), drawCallFirstVertex,
+                                                  verticesPerInstance * skippedInstances,
+                                                  mDriverUniforms.xfbBufferOffsets);
+}
+
 angle::Result ContextMtl::handleDirtyDepthStencilState(const gl::Context *context)
 {
     ASSERT(mRenderEncoder.valid());
 
     // Need to handle the case when render pass doesn't have depth/stencil attachment.
     mtl::DepthStencilDesc dsDesc              = mDepthStencilDesc;
-    const mtl::RenderPassDesc &renderPassDesc = mDrawFramebuffer->getRenderPassDesc(this);
+    const mtl::RenderPassDesc &renderPassDesc = mRenderEncoder.renderPassDesc();
 
-    if (!renderPassDesc.depthAttachment.texture)
+    if (!renderPassDesc.depthAttachment.texture())
     {
         dsDesc.depthWriteEnabled    = false;
         dsDesc.depthCompareFunction = MTLCompareFunctionAlways;
     }
 
-    if (!renderPassDesc.stencilAttachment.texture)
+    if (!renderPassDesc.stencilAttachment.texture())
     {
         dsDesc.frontFaceStencil.reset();
         dsDesc.backFaceStencil.reset();
@@ -1666,10 +2316,10 @@ angle::Result ContextMtl::handleDirtyDepthBias(const gl::Context *context)
     return angle::Result::Continue;
 }
 
-angle::Result ContextMtl::checkIfPipelineChanged(
-    const gl::Context *context,
-    gl::PrimitiveMode primitiveMode,
-    Optional<mtl::RenderPipelineDesc> *changedPipelineDesc)
+angle::Result ContextMtl::checkIfPipelineChanged(const gl::Context *context,
+                                                 gl::PrimitiveMode primitiveMode,
+                                                 bool xfbPass,
+                                                 bool *pipelineDescChanged)
 {
     ASSERT(mRenderEncoder.valid());
     mtl::PrimitiveTopologyClass topologyClass = mtl::GetPrimitiveTopologyClass(primitiveMode);
@@ -1683,15 +2333,50 @@ angle::Result ContextMtl::checkIfPipelineChanged(
 
     if (rppChange)
     {
-        const mtl::RenderPassDesc &renderPassDesc = mDrawFramebuffer->getRenderPassDesc(this);
-        // Obtain RenderPipelineDesc's output descriptor.
-        renderPassDesc.populateRenderPipelineOutputDesc(mBlendDesc,
-                                                        &mRenderPipelineDesc.outputDescriptor);
+        const mtl::RenderPassDesc &renderPassDesc = mRenderEncoder.renderPassDesc();
 
+        if (mState.isWebGL())
+        {
+            // For WebGL, we store color mask as part of framebuffer's state.
+            mtl::BlendDesc perFBOBlendDesc = mBlendDesc;
+            perFBOBlendDesc.writeMask      = mDrawFramebuffer->getLastSavedColorMask();
+            // Obtain RenderPipelineDesc's output descriptor.
+            renderPassDesc.populateRenderPipelineOutputDesc(perFBOBlendDesc,
+                                                            &mRenderPipelineDesc.outputDescriptor);
+        }
+        else
+        {
+            // Obtain RenderPipelineDesc's output descriptor.
+            renderPassDesc.populateRenderPipelineOutputDesc(mBlendDesc,
+                                                            &mRenderPipelineDesc.outputDescriptor);
+        }
+
+        if (xfbPass)
+        {
+            // In XFB pass, we disable fragment shader.
+            mRenderPipelineDesc.rasterizationType = mtl::RenderPipelineRasterization::Disabled;
+        }
+        else if (mState.isRasterizerDiscardEnabled())
+        {
+            // If XFB is not active and rasterizer discard is enabled, we need to emulate the
+            // discard. Because in this case, vertex shader might write to stage output values and
+            // Metal doesn't allow rasterization to be disabled.
+            mRenderPipelineDesc.rasterizationType =
+                mtl::RenderPipelineRasterization::EmulatedDiscard;
+        }
+        else
+        {
+            mRenderPipelineDesc.rasterizationType = mtl::RenderPipelineRasterization::Enabled;
+        }
         mRenderPipelineDesc.inputPrimitiveTopology = topologyClass;
+        mRenderPipelineDesc.alphaToCoverageEnabled = mState.isSampleAlphaToCoverageEnabled();
+        mRenderPipelineDesc.emulateCoverageMask    = mState.isSampleCoverageEnabled();
 
-        *changedPipelineDesc = mRenderPipelineDesc;
+        mRenderPipelineDesc.outputDescriptor.updateEnabledDrawBuffers(
+            mDrawFramebuffer->getState().getEnabledDrawBuffers());
     }
+
+    *pipelineDescChanged = rppChange;
 
     return angle::Result::Continue;
 }

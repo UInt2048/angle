@@ -180,6 +180,14 @@ EGLAttrib GetDisplayTypeFromEnvironment()
     }
 #endif
 
+#if defined(ANGLE_ENABLE_METAL)
+    if (rx::IsMetalDisplayAvailable())
+    {
+        return EGL_PLATFORM_ANGLE_TYPE_METAL_ANGLE;
+    }
+    // else fallthrough to below
+#endif
+
 #if defined(ANGLE_ENABLE_D3D11)
     return EGL_PLATFORM_ANGLE_TYPE_D3D11_ANGLE;
 #elif defined(ANGLE_ENABLE_D3D9)
@@ -193,7 +201,11 @@ EGLAttrib GetDisplayTypeFromEnvironment()
     return EGL_PLATFORM_ANGLE_TYPE_OPENGL_ANGLE;
 #    endif
 #elif defined(ANGLE_ENABLE_METAL)
-    return EGL_PLATFORM_ANGLE_TYPE_METAL_ANGLE;
+    // If we reach this point, it means rx::IsMetalDisplayAvailable() return false
+    // and ANGLE_ENABLE_OPENGL is not defined.
+    // Use default type as a fallback. Just to please the compiler.
+    // CreateDisplayFromAttribs() will fail regardless.
+    return EGL_PLATFORM_ANGLE_TYPE_DEFAULT_ANGLE;
 #elif defined(ANGLE_ENABLE_VULKAN)
     return EGL_PLATFORM_ANGLE_TYPE_VULKAN_ANGLE;
 #elif defined(ANGLE_ENABLE_NULL)
@@ -228,6 +240,21 @@ rx::DisplayImpl *CreateDisplayFromAttribs(EGLAttrib displayType,
     ASSERT(displayType != EGL_PLATFORM_ANGLE_TYPE_DEFAULT_ANGLE);
     rx::DisplayImpl *impl = nullptr;
 
+#if defined(ANGLE_ENABLE_METAL)
+    if (displayType == EGL_PLATFORM_ANGLE_TYPE_METAL_ANGLE && !rx::IsMetalDisplayAvailable())
+    {
+        // Fallback to default type
+        displayType = EGL_PLATFORM_ANGLE_TYPE_DEFAULT_ANGLE;
+        WARN() << "EGL_PLATFORM_ANGLE_TYPE_METAL_ANGLE is not available, fallback to "
+                  "EGL_PLATFORM_ANGLE_TYPE_DEFAULT_ANGLE";
+    }
+#endif
+
+    if (displayType == EGL_PLATFORM_ANGLE_TYPE_DEFAULT_ANGLE)
+    {
+        displayType = GetDisplayTypeFromEnvironment();
+    }
+
     switch (displayType)
     {
         case EGL_PLATFORM_ANGLE_TYPE_DEFAULT_ANGLE:
@@ -248,8 +275,10 @@ rx::DisplayImpl *CreateDisplayFromAttribs(EGLAttrib displayType,
 #if defined(ANGLE_ENABLE_OPENGL)
 #    if defined(ANGLE_PLATFORM_WINDOWS)
             impl = new rx::DisplayWGL(state);
-#    elif defined(ANGLE_PLATFORM_MACOS) || defined(ANGLE_PLATFORM_MACCATALYST)
+#    elif defined(ANGLE_PLATFORM_MACOS)
             impl = new rx::DisplayCGL(state);
+#    elif defined(ANGLE_PLATFORM_MACCATALYST)
+            impl = nullptr;  // Mac Catalyst doesn't support OpenGL.
 #    elif defined(ANGLE_PLATFORM_IOS)
             impl = new rx::DisplayEAGL(state);
 #    elif defined(ANGLE_PLATFORM_LINUX)

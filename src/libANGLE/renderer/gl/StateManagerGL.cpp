@@ -2162,6 +2162,13 @@ void StateManagerGL::validateState() const
                 continue;
             }
         }
+        if (bindingType == gl::BufferBinding::DrawIndirect)
+        {
+            if (!nativegl::SupportsDrawIndirect(mFunctions))
+            {
+                continue;
+            }
+        }
 
         // Transform feedback buffer bindings are tracked in TransformFeedbackGL
         if (bindingType == gl::BufferBinding::TransformFeedback)

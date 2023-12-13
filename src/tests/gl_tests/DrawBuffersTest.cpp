@@ -206,6 +206,15 @@ class DrawBuffersTest : public ANGLETest
         verifyAttachment2DColor(index, texture, target, level, getColorForIndex(index));
     }
 
+    void verifyAttachment3DOES(unsigned int index, GLuint texture, GLint level, GLint layer)
+    {
+        ANGLE_SKIP_TEST_IF(!IsGLExtensionEnabled("GL_OES_texture_3D"));
+
+        glFramebufferTexture3DOES(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_3D, texture,
+                                  level, layer);
+        EXPECT_PIXEL_COLOR_EQ(getWindowWidth() / 2, getWindowHeight() / 2, getColorForIndex(index));
+    }
+
     void verifyAttachmentLayer(unsigned int index, GLuint texture, GLint level, GLint layer)
     {
         glFramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, texture, level, layer);
@@ -476,6 +485,99 @@ TEST_P(DrawBuffersWebGL2Test, TwoProgramsWithDifferentOutputsAndClear)
     glDeleteProgram(program);
 }
 
+TEST_P(DrawBuffersTest, TwoProgramsWithDifferentOutputsAndClear)
+{
+    // TODO(http://anglebug.com/2872): Broken on the GL back-end.
+    ANGLE_SKIP_TEST_IF(IsOpenGL());
+
+    // TODO(ynovikov): Investigate the failure (https://anglebug.com/1533)
+    ANGLE_SKIP_TEST_IF(IsWindows() && IsAMD() && IsDesktopOpenGL());
+
+    // TODO(syoussefi): Qualcomm driver crashes in the presence of VK_ATTACHMENT_UNUSED.
+    // http://anglebug.com/3423
+    ANGLE_SKIP_TEST_IF(IsVulkan() && IsAndroid());
+
+    ANGLE_SKIP_TEST_IF(!setupTest());
+
+    glGetIntegerv(GL_MAX_DRAW_BUFFERS, &mMaxDrawBuffers);
+    ASSERT_GE(mMaxDrawBuffers, 4);
+
+    bool flags[8]       = {false};
+    GLenum only2ndBuf[] = {GL_NONE, GL_COLOR_ATTACHMENT1, GL_NONE, GL_NONE};
+    GLenum someBufs[4]  = {GL_NONE};
+    GLenum allBufs[4]   = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2,
+                         GL_COLOR_ATTACHMENT3};
+
+    constexpr GLuint kMaxBuffers     = 4;
+    constexpr GLuint kHalfMaxBuffers = 2;
+
+    // Enable all draw buffers.
+    for (GLuint texIndex = 0; texIndex < kMaxBuffers; texIndex++)
+    {
+        glBindTexture(GL_TEXTURE_2D, mTextures[texIndex]);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + texIndex, GL_TEXTURE_2D,
+                               mTextures[texIndex], 0);
+        someBufs[texIndex] =
+            texIndex >= kHalfMaxBuffers ? GL_COLOR_ATTACHMENT0 + texIndex : GL_NONE;
+
+        // Mask out the first two buffers.
+        flags[texIndex] = texIndex >= kHalfMaxBuffers;
+    }
+
+    GLuint program;
+    setupMRTProgram(flags, &program);
+
+    // Now set up a second simple program that draws to FragColor. Should be broadcast.
+    ANGLE_GL_PROGRAM(simpleProgram, essl1_shaders::vs::Simple(), essl1_shaders::fs::Red());
+
+    // Draw with simple program.
+    drawQuad(simpleProgram, essl1_shaders::PositionAttrib(), 0.5f, 1.0f, true);
+    ASSERT_GL_NO_ERROR();
+
+    // Clear 2nd draw buffers
+    setDrawBuffers(kMaxBuffers, only2ndBuf);
+    glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    verifyAttachment2DColor(1, mTextures[1], GL_TEXTURE_2D, 0, GLColor::transparentBlack);
+
+    // Clear last 2 draw buffers.
+    setDrawBuffers(kMaxBuffers, someBufs);
+    glClearColor(0.0f, 1.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    ASSERT_GL_NO_ERROR();
+
+    // Verify first is drawn red, second is untouched, and last two are cleared green.
+    verifyAttachment2DColor(0, mTextures[0], GL_TEXTURE_2D, 0, GLColor::red);
+    verifyAttachment2DColor(1, mTextures[1], GL_TEXTURE_2D, 0, GLColor::transparentBlack);
+    verifyAttachment2DColor(2, mTextures[2], GL_TEXTURE_2D, 0, GLColor::green);
+    verifyAttachment2DColor(3, mTextures[3], GL_TEXTURE_2D, 0, GLColor::green);
+
+    // Draw with MRT program.
+    setDrawBuffers(kMaxBuffers, someBufs);
+    drawQuad(program, positionAttrib(), 0.5, 1.0f, true);
+    ASSERT_GL_NO_ERROR();
+
+    // Only the last two attachments should be updated.
+    verifyAttachment2DColor(0, mTextures[0], GL_TEXTURE_2D, 0, GLColor::red);
+    verifyAttachment2DColor(1, mTextures[1], GL_TEXTURE_2D, 0, GLColor::transparentBlack);
+    verifyAttachment2D(2, mTextures[2], GL_TEXTURE_2D, 0);
+    verifyAttachment2D(3, mTextures[3], GL_TEXTURE_2D, 0);
+
+    // Active all draw buffers.
+    setDrawBuffers(kMaxBuffers, allBufs);
+
+    // Clear again. All attachments should be cleared.
+    glClear(GL_COLOR_BUFFER_BIT);
+    verifyAttachment2DColor(0, mTextures[0], GL_TEXTURE_2D, 0, GLColor::green);
+    verifyAttachment2DColor(1, mTextures[1], GL_TEXTURE_2D, 0, GLColor::green);
+    verifyAttachment2DColor(2, mTextures[2], GL_TEXTURE_2D, 0, GLColor::green);
+    verifyAttachment2DColor(3, mTextures[3], GL_TEXTURE_2D, 0, GLColor::green);
+
+    glDeleteProgram(program);
+}
+
 TEST_P(DrawBuffersTest, UnwrittenOutputVariablesShouldNotCrash)
 {
     ANGLE_SKIP_TEST_IF(!setupTest());
@@ -550,6 +652,49 @@ TEST_P(DrawBuffersTest, BroadcastGLFragColor)
 
     verifyAttachment2D(0, mTextures[0], GL_TEXTURE_2D, 0);
     verifyAttachment2D(0, mTextures[1], GL_TEXTURE_2D, 0);
+
+    EXPECT_GL_NO_ERROR();
+
+    glDeleteProgram(program);
+}
+
+TEST_P(DrawBuffersTest, 3DTexturesOES)
+{
+    ANGLE_SKIP_TEST_IF(!setupTest());
+
+    GLTexture texture;
+    glBindTexture(GL_TEXTURE_3D, texture.get());
+    glTexImage3DOES(GL_TEXTURE_3D, 0, GL_RGBA, getWindowWidth(), getWindowHeight(),
+                    getWindowWidth(), 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+
+    glFramebufferTexture3DOES(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_3D, texture.get(), 0,
+                              0);
+    glFramebufferTexture3DOES(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_3D, texture.get(), 0,
+                              1);
+    glFramebufferTexture3DOES(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2, GL_TEXTURE_3D, texture.get(), 0,
+                              2);
+    glFramebufferTexture3DOES(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT3, GL_TEXTURE_3D, texture.get(), 0,
+                              3);
+
+    bool flags[8] = {true, true, true, true, false};
+
+    GLuint program;
+    setupMRTProgram(flags, &program);
+
+    const GLenum bufs[] = {
+        GL_COLOR_ATTACHMENT0,
+        GL_COLOR_ATTACHMENT1,
+        GL_COLOR_ATTACHMENT2,
+        GL_COLOR_ATTACHMENT3,
+    };
+
+    setDrawBuffers(4, bufs);
+    drawQuad(program, positionAttrib(), 0.5);
+
+    verifyAttachment3DOES(0, texture.get(), 0, 0);
+    verifyAttachment3DOES(1, texture.get(), 0, 1);
+    verifyAttachment3DOES(2, texture.get(), 0, 2);
+    verifyAttachment3DOES(3, texture.get(), 0, 3);
 
     EXPECT_GL_NO_ERROR();
 

@@ -9,9 +9,12 @@
 
 #include "libANGLE/renderer/metal/RenderTargetMtl.h"
 
+#include "libANGLE/renderer/metal/mtl_state_cache.h"
+
 namespace rx
 {
-RenderTargetMtl::RenderTargetMtl() {}
+RenderTargetMtl::RenderTargetMtl()
+{}
 
 RenderTargetMtl::~RenderTargetMtl()
 {
@@ -19,39 +22,50 @@ RenderTargetMtl::~RenderTargetMtl()
 }
 
 RenderTargetMtl::RenderTargetMtl(RenderTargetMtl &&other)
-    : mTexture(std::move(other.mTexture)),
-      mLevelIndex(other.mLevelIndex),
-      mLayerIndex(other.mLayerIndex)
+    : mTextureRenderTargetInfo(std::move(other.mTextureRenderTargetInfo))
 {}
 
 void RenderTargetMtl::set(const mtl::TextureRef &texture,
-                          size_t level,
-                          size_t layer,
+                          uint32_t level,
+                          uint32_t layer,
                           const mtl::Format &format)
 {
-    mTexture    = texture;
-    mLevelIndex = level;
-    mLayerIndex = layer;
-    mFormat     = &format;
+    set(texture, nullptr, level, layer, format);
 }
 
-void RenderTargetMtl::set(const mtl::TextureRef &texture)
+void RenderTargetMtl::set(const mtl::TextureRef &texture,
+                          const mtl::TextureRef &implicitMSTexture,
+                          uint32_t level,
+                          uint32_t layer,
+                          const mtl::Format &format)
 {
-    mTexture = texture;
+    mTextureRenderTargetInfo.targetTexture           = texture;
+    mTextureRenderTargetInfo.targetImplicitMSTexture = implicitMSTexture;
+    mTextureRenderTargetInfo.targetLevel             = level;
+    mTextureRenderTargetInfo.targetSliceOrDepth      = layer;
+    mTextureRenderTargetInfo.targetBlendable         = format.getCaps().blendable;
+    mFormat                                     = &format;
+}
+
+void RenderTargetMtl::setTexture(const mtl::TextureRef &texture)
+{
+    mTextureRenderTargetInfo.targetTexture = texture;
+}
+
+void RenderTargetMtl::setImplicitMSTexture(const mtl::TextureRef &implicitMSTexture)
+{
+    mTextureRenderTargetInfo.targetImplicitMSTexture = implicitMSTexture;
 }
 
 void RenderTargetMtl::reset()
 {
-    mTexture.reset();
-    mLevelIndex = 0;
-    mLayerIndex = 0;
-    mFormat     = nullptr;
+    mTextureRenderTargetInfo.reset();
+    mFormat = nullptr;
 }
 
 void RenderTargetMtl::toRenderPassAttachmentDesc(mtl::RenderPassAttachmentDesc *rpaDescOut) const
 {
-    rpaDescOut->texture = mTexture;
-    rpaDescOut->level   = static_cast<uint32_t>(mLevelIndex);
-    rpaDescOut->slice   = static_cast<uint32_t>(mLayerIndex);
+    *static_cast<mtl::RenderPassAttachmentTextureTargetDesc *>(rpaDescOut) =
+        mTextureRenderTargetInfo;
 }
 }

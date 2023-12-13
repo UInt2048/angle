@@ -19,6 +19,11 @@
 
 namespace angle
 {
+std::string GetResourceDirectory()
+{
+    return GetExecutableDirectory();
+}
+
 Optional<std::string> GetCWD()
 {
     std::array<char, 4096> pathBuf;

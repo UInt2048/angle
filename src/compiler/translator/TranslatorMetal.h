@@ -25,6 +25,11 @@ class TranslatorMetal : public TranslatorVulkan
   public:
     TranslatorMetal(sh::GLenum type, ShShaderSpec spec);
 
+    static const char *GetCoverageMaskEnabledConstName();
+    static const char *GetRasterizationDiscardEnabledConstName();
+
+    void enableEmulatedInstanceID(bool e) { mEmulatedInstanceID = e; }
+
   protected:
     ANGLE_NO_DISCARD bool translate(TIntermBlock *root,
                                     ShCompileOptions compileOptions,
@@ -32,6 +37,17 @@ class TranslatorMetal : public TranslatorVulkan
 
     ANGLE_NO_DISCARD bool transformDepthBeforeCorrection(TIntermBlock *root,
                                                          const TVariable *driverUniforms) override;
+
+    // Do a linear map of depth from [0-1] to [znear-zfar]
+    ANGLE_NO_DISCARD bool linearMapDepth(TIntermBlock *root, const TVariable *driverUniforms);
+
+    void createGraphicsDriverUniformAdditionFields(std::vector<TField *> *fieldsOut) override;
+
+    ANGLE_NO_DISCARD bool insertSampleMaskWritingLogic(TIntermBlock *root,
+                                                       const TVariable *driverUniforms);
+    ANGLE_NO_DISCARD bool insertRasterizationDiscardLogic(TIntermBlock *root);
+
+    bool mEmulatedInstanceID = false;
 };
 
 }  // namespace sh

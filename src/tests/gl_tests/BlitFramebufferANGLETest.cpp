@@ -4,6 +4,7 @@
 // found in the LICENSE file.
 //
 
+#include "include/platform/FeaturesMtl.h"
 #include "test_utils/ANGLETest.h"
 #include "test_utils/gl_raii.h"
 
@@ -1100,7 +1101,20 @@ TEST_P(BlitFramebufferANGLETest, Errors)
 // TODO(geofflang): Fix the dependence on glBlitFramebufferANGLE without checks and assuming the
 // default framebuffer is BGRA to enable the GL and GLES backends. (http://anglebug.com/1289)
 
-class BlitFramebufferTest : public ANGLETest
+// The second param is a boolean value indicating platform features is overriden or not
+using BlitFramebufferParams = std::tuple<angle::PlatformParameters, bool>;
+
+struct PrintToStringParamName
+{
+    std::string operator()(const ::testing::TestParamInfo<BlitFramebufferParams> &info) const
+    {
+        ::std::stringstream ss;
+        ss << std::get<0>(info.param);
+        return ss.str();
+    }
+};
+
+class BlitFramebufferTest : public ANGLETestWithParam<BlitFramebufferParams>
 {
   protected:
     BlitFramebufferTest()
@@ -1141,6 +1155,14 @@ class BlitFramebufferTest : public ANGLETest
         glViewport(0, 0, width, height);
         glBindFramebuffer(GL_FRAMEBUFFER, *fbo);
         drawQuad(checkerProgram.get(), essl1_shaders::PositionAttrib(), 0.5f);
+    }
+
+    void overrideFeaturesMetal(FeaturesMtl *features) override
+    {
+        if (::testing::get<1>(GetParam()))
+        {
+            features->overrideFeatures({"has_stencil_output"}, false);
+        }
     }
 };
 
@@ -1344,7 +1366,7 @@ TEST_P(BlitFramebufferTest, ScissoredMultisampleStencil)
     ANGLE_SKIP_TEST_IF(IsAMD() && IsOpenGL() && IsWindows());
 
     // Fails verifying that the middle pixel is red. http://anglebug.com/3496
-    ANGLE_SKIP_TEST_IF((IsIntel() || IsAMD()) && IsOSX());
+    ANGLE_SKIP_TEST_IF((IsIntel() || IsAMD()) && IsOSX() && IsOpenGL());
 
     constexpr GLuint kSize = 256;
 
@@ -1997,9 +2019,24 @@ ANGLE_INSTANTIATE_TEST(BlitFramebufferANGLETest,
                        ES2_D3D9(),
                        ES2_D3D11(),
                        ES2_D3D11_PRESENT_PATH_FAST(),
+                       ES2_METAL(),
                        ES2_OPENGL(),
                        ES3_OPENGL(),
                        ES2_VULKAN(),
                        ES3_VULKAN());
 
-ANGLE_INSTANTIATE_TEST_ES3(BlitFramebufferTest);
+const angle::PlatformParameters platformsBlitFramebuffer[] = {ANGLE_ALL_TEST_PLATFORMS_ES3};
+
+INSTANTIATE_TEST_SUITE_P(,
+                         BlitFramebufferTest,
+                         testing::Combine(testing::ValuesIn(::angle::FilterTestParams(
+                                              platformsBlitFramebuffer,
+                                              ArraySize(platformsBlitFramebuffer))),
+                                          testing::Values(false)),
+                         PrintToStringParamName());
+
+// Simulate missing fragment stencil write feature in Metal.
+INSTANTIATE_TEST_SUITE_P(OverrideFeatures,
+                         BlitFramebufferTest,
+                         testing::Combine(testing::Values(ES3_METAL()), testing::Values(true)),
+                         PrintToStringParamName());

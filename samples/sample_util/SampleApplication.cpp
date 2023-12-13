@@ -15,6 +15,11 @@
 #include <iostream>
 #include <utility>
 
+// Use environment variable if this variable is not compile time defined.
+#if !defined(ANGLE_EGL_LIBRARY_NAME)
+#    define ANGLE_EGL_LIBRARY_NAME angle::GetEnvironmentVar("ANGLE_EGL_LIBRARY_NAME").c_str()
+#endif
+
 namespace
 {
 const char *kUseAngleArg = "--use-angle=";
@@ -138,13 +143,8 @@ EGLContext SampleApplication::getContext() const
     return mEGLWindow->getContext();
 }
 
-int SampleApplication::run()
+int SampleApplication::prepareToRun()
 {
-    if (!mOSWindow->initialize(mName, mWidth, mHeight))
-    {
-        return -1;
-    }
-
     mOSWindow->setVisible(true);
 
     ConfigParameters configParams;
@@ -168,57 +168,89 @@ int SampleApplication::run()
 
     angle::LoadGLES(eglGetProcAddress);
 
-    mRunning   = true;
-    int result = 0;
+    mRunning = true;
 
     if (!initialize())
     {
         mRunning = false;
-        result   = -1;
+        return -1;
     }
 
     mTimer.start();
-    double prevTime = 0.0;
+    mPrevTime = 0.0;
 
-    while (mRunning)
+    return 0;
+}
+
+int SampleApplication::runIteration()
+{
+    double elapsedTime = mTimer.getElapsedTime();
+    double deltaTime   = elapsedTime - mPrevTime;
+
+    step(static_cast<float>(deltaTime), elapsedTime);
+
+    // Clear events that the application did not process from this frame
+    Event event;
+    while (popEvent(&event))
     {
-        double elapsedTime = mTimer.getElapsedTime();
-        double deltaTime   = elapsedTime - prevTime;
-
-        step(static_cast<float>(deltaTime), elapsedTime);
-
-        // Clear events that the application did not process from this frame
-        Event event;
-        while (popEvent(&event))
+        // If the application did not catch a close event, close now
+        switch (event.Type)
         {
-            // If the application did not catch a close event, close now
-            switch (event.Type)
-            {
-                case Event::EVENT_CLOSED:
-                    exit();
-                    break;
-                case Event::EVENT_KEY_RELEASED:
-                    onKeyUp(event.Key);
-                    break;
-                case Event::EVENT_KEY_PRESSED:
-                    onKeyDown(event.Key);
-                    break;
-                default:
-                    break;
-            }
+            case Event::EVENT_CLOSED:
+                exit();
+                break;
+            case Event::EVENT_KEY_RELEASED:
+                onKeyUp(event.Key);
+                break;
+            case Event::EVENT_KEY_PRESSED:
+                onKeyDown(event.Key);
+                break;
+            default:
+                break;
+        }
+    }
+
+    if (!mRunning)
+    {
+        return 0;
+    }
+
+    draw();
+    swap();
+
+    mOSWindow->messageLoop();
+
+    mPrevTime = elapsedTime;
+
+    return 0;
+}
+
+int SampleApplication::run()
+{
+    if (!mOSWindow->initialize(mName, mWidth, mHeight))
+    {
+        return -1;
+    }
+
+    int result = 0;
+    if (mOSWindow->hasOwnLoop())
+    {
+        // The Window platform has its own message loop, so let it run its own
+        // using our delegates.
+        result = mOSWindow->runOwnLoop([this] { return prepareToRun(); },
+                                       [this] { return runIteration(); });
+    }
+    else
+    {
+        if ((result = prepareToRun()))
+        {
+            return result;
         }
 
-        if (!mRunning)
+        while (mRunning)
         {
-            break;
+            runIteration();
         }
-
-        draw();
-        swap();
-
-        mOSWindow->messageLoop();
-
-        prevTime = elapsedTime;
     }
 
     destroy();

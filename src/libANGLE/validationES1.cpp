@@ -129,6 +129,7 @@ bool ValidateBuiltinVertexAttributeCommon(const Context *context,
     switch (type)
     {
         case VertexAttribType::Byte:
+        case VertexAttribType::UnsignedByte:
             if (arrayType == ClientVertexArrayType::PointSize)
             {
                 context->validationError(GL_INVALID_ENUM, kInvalidVertexPointerType);
@@ -136,6 +137,7 @@ bool ValidateBuiltinVertexAttributeCommon(const Context *context,
             }
             break;
         case VertexAttribType::Short:
+        case VertexAttribType::UnsignedShort:
             if (arrayType == ClientVertexArrayType::PointSize ||
                 arrayType == ClientVertexArrayType::Color)
             {

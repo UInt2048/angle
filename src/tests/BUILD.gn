@@ -146,6 +146,14 @@ if (is_win || is_linux || is_mac || is_android || is_fuchsia) {
         "CoreFoundation.framework",
         "IOSurface.framework",
       ]
+      ldflags = [
+        "-weak_framework",
+        "Metal",
+      ]
+      cflags_objcc = [
+        "-Wno-nullability-completeness",
+        "-Wno-unguarded-availability",
+      ]
     }
     if (is_win) {
       sources += angle_end2end_tests_win_sources
@@ -761,6 +769,7 @@ if (build_angle_deqp_tests && !is_fuchsia) {
         "/wd4706",  # assignment within conditional expression
         "/wd4834",  # discarding return value of function with 'nodiscard'
                     # attribute
+
         "/wd4838",  # conversion requires a narrowing conversion
         "/wd4996",  # deprecated
       ]
@@ -790,6 +799,7 @@ if (build_angle_deqp_tests && !is_fuchsia) {
         "-Wno-sizeof-array-div",  # https://gitlab.khronos.org/Tracker/vk-gl-cts/issues/2127
         "-Wno-string-conversion",  # implicit conversion turns string literal
                                    # into bool
+
         "-Wno-unused-function",
         "-Wno-unused-local-typedef",
         "-Wno-unused-result",  # ignoring return value of function declared with

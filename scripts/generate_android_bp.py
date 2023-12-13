@@ -137,8 +137,7 @@ target_blackist = [
     '//build/config:shared_library_deps',
 ]
 
-include_blacklist = [
-]
+include_blacklist = []
 
 
 def gn_deps_to_blueprint_deps(target_info, build_info):

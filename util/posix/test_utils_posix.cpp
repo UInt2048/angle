@@ -29,6 +29,16 @@
 #    include <sys/resource.h>
 #endif
 
+#if defined (ANGLE_PLATFORM_APPLE) && TARGET_OS_TV
+// Unsupported functions.
+#    define fork(...) \
+        ({            \
+            abort();  \
+            0;        \
+        })
+#    define execv(...) abort()
+#endif
+
 namespace angle
 {
 namespace
@@ -312,8 +322,8 @@ void Sleep(unsigned int milliseconds)
     else
     {
         timespec sleepTime = {
-            .tv_sec  = milliseconds / 1000,
-            .tv_nsec = (milliseconds % 1000) * 1000000,
+            .tv_sec  = static_cast<time_t>(milliseconds / 1000),
+            .tv_nsec = static_cast<long>((milliseconds % 1000) * 1000000),
         };
 
         nanosleep(&sleepTime, nullptr);
